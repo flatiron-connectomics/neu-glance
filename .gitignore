@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+*.log
+
+# editor
+.vscode/
+.idea/
+.ipynb_checkpoints/
+
+# Site-specific configs. The LEADING SLASH is load-bearing: a bare `configs/` would match
+# at any depth.
+/configs/
+
+# Generated states and links are one person's view of one dataset, not the package's.
+*.state.json
+*.layer.json

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "em-ngl"
+version = "0.1.0"
+description = "Neuroglancer viewer states, annotation layers and shareable links, built from EM volumes and precomputed annotation sources."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "Erik Schomburg", email = "eschomburg@flatironinstitute.org" }]
+# In the shared conda env this comes from conda-forge, so install with
+# `pip install --no-deps -e .` to keep pip from re-resolving tensorstore.
+dependencies = [
+    "em-volume-tools",     # volume metadata, store reads, occupancy boxes
+]
+# Deliberately NOT declared:
+#   numpy/pandas — nothing here does array or table work. `layers` and `state` are pure
+#     dict-and-list manipulation, which is what keeps them testable with no fixture.
+#   neuroglancer — see the `serve` extra below; it is not needed to BUILD a state, only to
+#     host one, and CI has no business downloading a viewer bundle.
+
+[project.optional-dependencies]
+dev = ["pytest"]
+# For a future `em-ngl serve`: host a local volume (an HDF5 chunk, say) at a localhost URL
+# and open a viewer on it, the way chunkflow does. Optional because building a state needs
+# none of it, and because the wheel carries a JS bundle.
+serve = ["neuroglancer>=2.40"]
+
+[project.scripts]
+# `em-ngl`, matching the abbreviated commands its siblings expose (`em-vol`, `em-morpho`,
+# `em-annot`). Here the library name matches the command rather than being spelled out,
+# because "neuroglancer" is not an abbreviation anyone needs expanded.
+em-ngl = "em_ngl.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["em_ngl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
