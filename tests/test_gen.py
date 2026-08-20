@@ -11,13 +11,13 @@ import urllib.parse
 import numpy as np
 import pytest
 
-from em_volume_tools import convert
-from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.profiles import zarr3_create_spec
+from neu_vol import convert
+from neu_vol.backends.tensorstore import TensorStoreBackend
+from neu_vol.profiles import zarr3_create_spec
 
-from em_ngl import cli
-from em_ngl.sources import SourceProblem, volume_layer
-from em_ngl.state import (DEFAULT_VIEWER, StateProblem, build_state, load_layer,
+from neu_glance import cli
+from neu_glance.sources import SourceProblem, volume_layer
+from neu_glance.state import (DEFAULT_VIEWER, StateProblem, build_state, load_layer,
                           parse_url, state_url)
 
 
@@ -141,7 +141,7 @@ def test_the_fragment_is_percent_encoded():
 def test_the_frame_comes_from_the_volume_metadata(tmp_path):
     """Precomputed carries every scale's size in the `info` already read, so this costs
     nothing; the numbers are xyz there and zyx here."""
-    from em_ngl.sources import volume_extent
+    from neu_glance.sources import volume_extent
 
     vol = _volume(tmp_path, "v")            # 16^3
     extent, offset = volume_extent(vol, "neuroglancer_precomputed")
@@ -153,8 +153,8 @@ def test_a_voxel_offset_shifts_the_frame(tmp_path):
     coordinate origin."""
     import json
 
-    from em_volume_tools.location import read_json, write_json
-    from em_ngl.sources import volume_extent
+    from neu_vol.location import read_json, write_json
+    from neu_glance.sources import volume_extent
 
     vol = _volume(tmp_path, "v")
     info = read_json(vol, "info")
@@ -167,7 +167,7 @@ def test_a_voxel_offset_shifts_the_frame(tmp_path):
 
 
 def test_zarr_volumes_report_a_frame_too(tmp_path):
-    from em_ngl.sources import volume_extent
+    from neu_glance.sources import volume_extent
 
     vol = _volume(tmp_path, "z", profile="local")
     assert volume_extent(vol, "zarr3")[0] == (16, 16, 16)
@@ -176,7 +176,7 @@ def test_zarr_volumes_report_a_frame_too(tmp_path):
 def test_default_view_centres_and_zooms_out():
     """Neuroglancer with no position opens at the origin CORNER, fully zoomed in — which
     on a large volume is a view of its empty edge."""
-    from em_ngl.state import NOMINAL_VIEWPORT_PX, default_view
+    from neu_glance.state import NOMINAL_VIEWPORT_PX, default_view
 
     centre, cross, projection = default_view((100, 200, 400))
     assert centre == [50.0, 100.0, 200.0]
@@ -373,9 +373,9 @@ def test_building_a_layer_does_not_open_every_level(tmp_path, monkeypatch):
 
     `describe` additionally OPENS EVERY LEVEL and probes for a foreign marker — the expensive
     inspection tier — and using it here meant ~20 store opens for numbers already read. Moved
-    with `volume_layer` out of em-volume-tools, where it used to be pinned.
+    with `volume_layer` out of neu-vol, where it used to be pinned.
     """
-    from em_volume_tools import source_metadata
+    from neu_vol import source_metadata
 
     vol = _volume(tmp_path, "v")
     calls = []
@@ -416,7 +416,7 @@ def _annotation_source(tmp_path, name="syn", *, properties=("conf_pre", "conf_po
 
 
 def test_an_annotation_source_becomes_an_annotation_layer(tmp_path):
-    from em_ngl.sources import annotation_layer
+    from neu_glance.sources import annotation_layer
 
     layer, _info = annotation_layer(_annotation_source(tmp_path))
     assert layer["type"] == "annotation"
@@ -426,14 +426,14 @@ def test_an_annotation_source_becomes_an_annotation_layer(tmp_path):
 def test_a_volume_passed_as_annotations_is_refused(tmp_path):
     """Both are `precomputed://` with an `info` at the root, so nothing about the URL tells
     them apart — and an annotation layer pointed at a volume loads and draws nothing."""
-    from em_ngl.sources import annotation_layer
+    from neu_glance.sources import annotation_layer
 
     with pytest.raises(SourceProblem, match="neuroglancer_annotations_v1"):
         annotation_layer(_volume(tmp_path, "v"))
 
 
 def test_the_shader_is_chosen_from_the_properties_the_source_declares(tmp_path):
-    from em_ngl.sources import annotation_layer
+    from neu_glance.sources import annotation_layer
 
     layer, info = annotation_layer(_annotation_source(tmp_path))
     assert "prop_conf_pre()" in layer["shader"]
@@ -443,7 +443,7 @@ def test_the_shader_is_chosen_from_the_properties_the_source_declares(tmp_path):
 def test_no_shader_is_applied_when_the_properties_do_not_match(tmp_path):
     """A shader naming an absent `prop_` does not degrade — it fails to compile and the layer
     draws NOTHING, with the error only in the shader tab. So no shader beats a wrong one."""
-    from em_ngl.sources import annotation_layer
+    from neu_glance.sources import annotation_layer
 
     src = _annotation_source(tmp_path, properties=("weight",))
     layer, info = annotation_layer(src)
@@ -452,7 +452,7 @@ def test_no_shader_is_applied_when_the_properties_do_not_match(tmp_path):
 
 
 def test_asking_for_a_shader_the_source_cannot_feed_is_an_error(tmp_path):
-    from em_ngl.sources import annotation_layer
+    from neu_glance.sources import annotation_layer
 
     src = _annotation_source(tmp_path, properties=("weight",))
     with pytest.raises(SourceProblem, match="conf_pre"):
@@ -460,7 +460,7 @@ def test_asking_for_a_shader_the_source_cannot_feed_is_an_error(tmp_path):
 
 
 def test_a_shader_can_be_a_file_or_switched_off(tmp_path):
-    from em_ngl.sources import annotation_layer
+    from neu_glance.sources import annotation_layer
 
     src = _annotation_source(tmp_path)
     glsl = tmp_path / "s.glsl"
@@ -473,7 +473,7 @@ def test_a_shader_can_be_a_file_or_switched_off(tmp_path):
 
 
 def test_an_unknown_shader_name_lists_the_built_ins(tmp_path):
-    from em_ngl.sources import annotation_layer
+    from neu_glance.sources import annotation_layer
 
     with pytest.raises(SourceProblem, match="synapse"):
         annotation_layer(_annotation_source(tmp_path), shader="nope")
@@ -483,7 +483,7 @@ def test_relationships_bind_to_the_named_segmentation_layer(tmp_path):
     """The binding is what makes the relationship index do anything: the source keys its
     relationships on segment id, but neuroglancer only consults them once each one is bound to
     a layer whose selection it can read."""
-    from em_ngl.sources import annotation_layer
+    from neu_glance.sources import annotation_layer
 
     layer, _info = annotation_layer(_annotation_source(tmp_path), linked_segmentation="seg")
     assert layer["linkedSegmentationLayer"] == {"body_pre": "seg", "body_post": "seg"}
@@ -491,7 +491,7 @@ def test_relationships_bind_to_the_named_segmentation_layer(tmp_path):
 
 
 def test_without_a_segmentation_there_is_no_binding(tmp_path):
-    from em_ngl.sources import annotation_layer
+    from neu_glance.sources import annotation_layer
 
     layer, _info = annotation_layer(_annotation_source(tmp_path))
     assert "linkedSegmentationLayer" not in layer
@@ -501,7 +501,7 @@ def test_without_a_segmentation_there_is_no_binding(tmp_path):
 def test_a_split_pair_filters_each_layer_on_one_relationship(tmp_path):
     """One source, two layers. Filtering on `body_pre` gives the selected body's outputs and on
     `body_post` its inputs; one layer filtered on both conflates the directions."""
-    from em_ngl.sources import annotation_layer_pair
+    from neu_glance.sources import annotation_layer_pair
 
     layers, _info = annotation_layer_pair(_annotation_source(tmp_path),
                                           linked_segmentation="seg")
@@ -517,7 +517,7 @@ def test_a_split_pair_filters_each_layer_on_one_relationship(tmp_path):
 def test_each_half_of_a_split_pair_shows_only_its_own_endpoint(tmp_path):
     """Drawn together the two markers overlap at any zoom showing more than a few synapses, and
     the connecting line's colour swamps them. Each half shows one end."""
-    from em_ngl.sources import annotation_layer_pair
+    from neu_glance.sources import annotation_layer_pair
 
     layers, _info = annotation_layer_pair(_annotation_source(tmp_path),
                                           linked_segmentation="seg")
@@ -530,7 +530,7 @@ def test_each_half_of_a_split_pair_shows_only_its_own_endpoint(tmp_path):
 def test_the_shader_draws_no_line_unless_both_ends_are_shown(tmp_path):
     """A synapse is a few hundred nm long, so at any useful zoom the line is sub-pixel; drawn in
     a blend of the endpoint colours it reads as one flat colour and hides the markers."""
-    from em_ngl.shaders import SHADERS
+    from neu_glance.shaders import SHADERS
 
     glsl = SHADERS["synapse"]["source"]
     assert "if (show_pre && show_post)" in glsl
@@ -538,7 +538,7 @@ def test_the_shader_draws_no_line_unless_both_ends_are_shown(tmp_path):
 
 
 def test_filtering_on_a_relationship_the_source_lacks_is_refused(tmp_path):
-    from em_ngl.sources import annotation_layer
+    from neu_glance.sources import annotation_layer
 
     src = _annotation_source(tmp_path, relationships=("body_pre",))
     with pytest.raises(SourceProblem, match="body_post"):
@@ -559,7 +559,7 @@ def test_the_cli_split_flag_adds_both_layers(tmp_path, capsys):
 
 def test_the_extent_and_voxel_size_come_from_the_sources_own_info(tmp_path):
     """So an annotations-only link opens framed on its data, and needs no --voxel-size."""
-    from em_ngl.sources import (annotation_source_extent, annotation_source_voxel_size,
+    from neu_glance.sources import (annotation_source_extent, annotation_source_voxel_size,
                                 read_annotation_info)
 
     info = read_annotation_info(_annotation_source(tmp_path))

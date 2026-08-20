@@ -1,25 +1,25 @@
-"""em-ngl — neuroglancer states, layers and links.
+"""neu-glance — neuroglancer states, layers and links.
 
 Everything that produces something a *viewer* consumes, and nothing that produces data. The
-split from em-volume-tools is deliberate and one-way: em-volume-tools writes volumes and
-em-annotation writes annotation sources, and neither knows a viewer exists. This package sits
+split from neu-vol is deliberate and one-way: neu-vol writes volumes and
+neu-mark writes annotation sources, and neither knows a viewer exists. This package sits
 above both, so a shader that reads a synapse property lives here rather than being pushed down
 into the library that happens to own the store access.
 
 Three things it makes, all from the same pieces:
 
-- a **state**, serialized as a URL or as JSON (:mod:`em_ngl.state`)
+- a **state**, serialized as a URL or as JSON (:mod:`neu_glance.state`)
 - a **layer** for something on a store — a volume or a precomputed annotation source
-  (:mod:`em_ngl.sources`)
+  (:mod:`neu_glance.sources`)
 - a **layer** of local annotations, from coordinates or from occupancy boxes
-  (:mod:`em_ngl.layers`)
+  (:mod:`neu_glance.layers`)
 
-:mod:`em_ngl.layers` and :mod:`em_ngl.state` are pure — plain data in, plain data out, no
-store access — and :mod:`em_ngl.sources` is the only module that reads anything. Keeping that
+:mod:`neu_glance.layers` and :mod:`neu_glance.state` are pure — plain data in, plain data out, no
+store access — and :mod:`neu_glance.sources` is the only module that reads anything. Keeping that
 line is what will let a locally served volume become a layer without touching state assembly.
 
-Top-level names resolve lazily (PEP 562) so ``em-ngl --help`` does not pay for
-em-volume-tools' import graph; ``cli`` reads ``__version__`` from here.
+Top-level names resolve lazily (PEP 562) so ``neu-glance --help`` does not pay for
+neu-vol' import graph; ``cli`` reads ``__version__`` from here.
 """
 
 from __future__ import annotations
@@ -61,8 +61,8 @@ __all__ = ["__version__", *sorted(_EXPORTS)]
 def __getattr__(name: str):
     """Resolve a top-level export on first use.
 
-    Eager imports here would make every ``em-ngl --help`` pay for em-volume-tools, since
-    :mod:`em_ngl.cli` reads ``__version__`` from this module. A test pins that.
+    Eager imports here would make every ``neu-glance --help`` pay for neu-vol, since
+    :mod:`neu_glance.cli` reads ``__version__`` from this module. A test pins that.
     """
     module = _EXPORTS.get(name)
     if module is None:

@@ -1,15 +1,15 @@
 """Layers built from something on a store: a volume, or a precomputed annotation source.
 
 This is the only module that reads a store, and it reads as little as it can. The whole
-em-volume-tools dependency is concentrated here so :mod:`em_ngl.state` and
-:mod:`em_ngl.layers` stay pure — which matters beyond tidiness: a layer whose source is a
+neu-vol dependency is concentrated here so :mod:`neu_glance.state` and
+:mod:`neu_glance.layers` stay pure — which matters beyond tidiness: a layer whose source is a
 locally served volume (`http://localhost:PORT/...`) has no store to inspect, so state
 assembly must never require one.
 
 Two things here fail silently if you get them wrong:
 
 - **The source scheme.** `precomputed://` vs `zarr://` is decided by
-  :func:`~em_volume_tools.source_metadata.detect_backend`, not by the path.
+  :func:`~neu_vol.source_metadata.detect_backend`, not by the path.
 - **Volume or annotation source.** Both are addressed `precomputed://` and both have an
   `info` at the root, so nothing about the URL tells them apart — and an annotation layer
   pointed at a volume loads happily and draws nothing at all. The ``@type`` is the only
@@ -27,7 +27,7 @@ from .shaders import SPLIT_CONTROLS, ShaderProblem, pick_shader
 #: works in older ones, and a link is the thing most likely to be opened by someone
 #: running a different viewer.
 def _scheme_map() -> dict[str, str]:
-    from em_volume_tools.source_metadata import PRECOMPUTED_GZ
+    from neu_vol.source_metadata import PRECOMPUTED_GZ
 
     return {"neuroglancer_precomputed": "precomputed",
             PRECOMPUTED_GZ: "precomputed",
@@ -55,8 +55,8 @@ def volume_extent(volume: str, fmt: str) -> tuple[tuple, tuple] | None:
     while zarr needs the level-0 array's own metadata — one open, not the every-level
     probe that ``describe`` does.
     """
-    from em_volume_tools.location import read_json
-    from em_volume_tools.source_metadata import read_source_metadata
+    from neu_vol.location import read_json
+    from neu_vol.source_metadata import read_source_metadata
 
     if str(fmt).startswith("neuroglancer_precomputed"):
         info = read_json(volume.rstrip("/") + "/info") or {}
@@ -72,7 +72,7 @@ def volume_extent(volume: str, fmt: str) -> tuple[tuple, tuple] | None:
     if not meta:
         return None
     try:
-        from em_volume_tools.backends.base import open_backend
+        from neu_vol.backends.base import open_backend
 
         shape = tuple(int(s) for s in open_backend(meta["data_spec"]).shape)
     except Exception:
@@ -90,7 +90,7 @@ def volume_layer(volume: str, *, kind: str | None = None, name: str | None = Non
     segmentation; without it the recorded value decides, because a segmentation shown as
     an image is a grey mush and the mistake is easy to miss on a small ROI.
     """
-    from em_volume_tools.source_metadata import detect_backend, read_source_metadata
+    from neu_vol.source_metadata import detect_backend, read_source_metadata
 
     volume = volume.rstrip("/")
     fmt = detect_backend(volume)
@@ -124,7 +124,7 @@ def volume_layer(volume: str, *, kind: str | None = None, name: str | None = Non
 
 def read_annotation_info(source: str) -> dict:
     """The ``info`` of a precomputed annotation source, refusing anything else."""
-    from em_volume_tools.location import read_json
+    from neu_vol.location import read_json
 
     source = source.rstrip("/")
     info = read_json(source, "info")
@@ -134,7 +134,7 @@ def read_annotation_info(source: str) -> dict:
         raise SourceProblem(
             f"{source} is {info.get('@type') or 'not an annotation source'}, not "
             f"{ANNOTATION_TYPE}. Volumes go to --image or --seg; --annotations wants a "
-            f"precomputed ANNOTATION source (what `em-annot annotation-source` writes).")
+            f"precomputed ANNOTATION source (what `neu-mark annotation-source` writes).")
     return info
 
 

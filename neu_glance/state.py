@@ -10,7 +10,7 @@ still loads.
 link carries no data anywhere — but it does mean the whole state travels in the URL, and a
 large inline annotation layer makes for a long one (see :data:`LONG_URL`).
 
-**Pure, like :mod:`em_ngl.layers`.** :func:`build_state` takes plain layer dicts and never asks
+**Pure, like :mod:`neu_glance.layers`.** :func:`build_state` takes plain layer dicts and never asks
 where a source lives. Keeping it that way is what will let a locally served volume
 (``http://localhost:PORT/…``, no store to inspect) become a layer with no changes here.
 """
@@ -157,7 +157,7 @@ def parse_url(url: str) -> dict:
 def load_layer(path: str, read_bytes=None) -> list[dict]:
     """A layer (or a whole state's worth of layers) from a JSON file.
 
-    Accepts what ``em-ngl bboxes`` and ``em-ngl annotate`` write either way round — a bare
+    Accepts what ``neu-glance bboxes`` and ``neu-glance annotate`` write either way round — a bare
     layer object, or a full state whose ``layers`` are taken — so it does not matter which of
     the two the caller happened to generate.
     """
@@ -177,7 +177,7 @@ def load_state(source: str, read_bytes=None) -> dict:
     """An existing state, from a neuroglancer URL **or** a JSON file.
 
     Accepting both is what makes ``--into`` usable directly on a link copied out of the
-    browser, with no intermediate ``em-ngl parse`` step.
+    browser, with no intermediate ``neu-glance parse`` step.
     """
     if "#!" in source:
         return parse_url(source)
@@ -191,7 +191,7 @@ def load_state(source: str, read_bytes=None) -> dict:
 
 def _read_json(path: str, read_bytes=None):
     if read_bytes is None:
-        from em_volume_tools.location import read_bytes as read_bytes_impl
+        from neu_vol.location import read_bytes as read_bytes_impl
         read_bytes = read_bytes_impl
     raw = read_bytes(path)
     if raw is None:

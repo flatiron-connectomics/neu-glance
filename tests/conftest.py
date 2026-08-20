@@ -17,7 +17,7 @@ lands somewhere faster. `--basetemp`, by contrast, `rm -rf`s the path it is give
 session start and retains nothing, so a failed run's artifacts are gone.
 
 Escape hatches, in the order they win: an explicit `--basetemp` (pytest ignores the
-temproot entirely), an inherited `PYTEST_DEBUG_TEMPROOT`, and `EM_TESTS_TMPFS=0` to
+temproot entirely), an inherited `PYTEST_DEBUG_TEMPROOT`, and `NEU_TESTS_TMPFS=0` to
 force the platform default.
 
 The *code* below is duplicated in all three em-* repos, which are separate git repos and
@@ -28,7 +28,7 @@ suite, and is the only part that differs between them.
 ## Running this suite in parallel
 
 `pytest-xdist` is in the `dev` extra and roughly halves this suite, but it is opt-in
-and deliberately **not** in `addopts`, so CI, the `em-vol-cv` environment, and anyone
+and deliberately **not** in `addopts`, so CI, the `neu-vol-cv` environment, and anyone
 without it installed are all unaffected:
 
     python -m pytest -q -n 4 --dist worksteal        # 21 s -> 10 s
@@ -39,8 +39,8 @@ process, so on a 32-core workstation `-n auto` picks 32 and lands at 20 s — no
 than serial. Measured: serial 21 s, `-n 2` 13 s, **`-n 3` / `-n 4` 10 s**, `-n 6` 11 s,
 `-n 8` 13 s, `-n 16` 20 s, `-n auto` 20 s.
 
-Do **not** bother for the sibling repos, both measured: em-blockrun is 4x *slower* under
-xdist (a 1 s suite, so worker startup is all of it), and em-seg-morpho does not improve
+Do **not** bother for the sibling repos, both measured: blockrun is 4x *slower* under
+xdist (a 1 s suite, so worker startup is all of it), and neu-morpho does not improve
 at any worker count because its real meshing/skeletonization already saturates ~2 cores
 through threaded libraries — more processes only oversubscribe.
 """
@@ -57,7 +57,7 @@ _CANDIDATES = ("/dev/shm", "/run/shm")
 
 def _tmpfs_root() -> str | None:
     """A writable tmpfs directory with room to spare, or None to leave the default."""
-    if os.environ.get("EM_TESTS_TMPFS") == "0":
+    if os.environ.get("NEU_TESTS_TMPFS") == "0":
         return None
     for candidate in _CANDIDATES:
         root = Path(candidate)

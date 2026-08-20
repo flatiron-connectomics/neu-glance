@@ -1,6 +1,6 @@
 """The output stage the three producers share: ``--format``, ``--into``, ``--out``.
 
-This is where the split from `em-vol` actually changed behaviour rather than moving it, so the
+This is where the split from `neu-vol` actually changed behaviour rather than moving it, so the
 assertions here are about the new contract: one state builder behind all three formats, and a
 merge that leaves the incoming view alone.
 """
@@ -10,12 +10,12 @@ import json
 import numpy as np
 import pytest
 
-from em_volume_tools import convert
-from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.profiles import zarr3_create_spec
+from neu_vol import convert
+from neu_vol.backends.tensorstore import TensorStoreBackend
+from neu_vol.profiles import zarr3_create_spec
 
-from em_ngl import cli
-from em_ngl.state import parse_url
+from neu_glance import cli
+from neu_glance.state import parse_url
 
 
 @pytest.fixture
@@ -42,7 +42,7 @@ def _out(capsys):
 # --format
 # --------------------------------------------------------------------------- #
 def test_gen_defaults_to_a_url_and_bboxes_to_a_layer(volume, capsys):
-    """Each command keeps the default its `em-vol` predecessor had, so the break is in the
+    """Each command keeps the default its `neu-vol` predecessor had, so the break is in the
     names only and not in what a command does when you run it the same way."""
     cli.main(["gen", "--image", volume])
     assert _out(capsys).startswith("https://")
@@ -130,7 +130,7 @@ def test_into_appends_and_keeps_the_existing_view(tmp_path, volume, capsys):
 
 def test_into_accepts_a_url_as_well_as_a_file(tmp_path, volume, capsys):
     """So it works on a link copied straight out of the browser, with no `parse` step."""
-    from em_ngl.state import state_url
+    from neu_glance.state import state_url
 
     base, _path = _base_state(tmp_path)
     cli.main(["bboxes", volume, "--no-tighten", "--into", state_url(base)])
@@ -222,7 +222,7 @@ def test_parse_can_list_just_the_layers(volume, capsys):
 def test_parse_survives_a_layers_entry_that_is_not_an_object(tmp_path, capsys):
     """A published reference state carries a bare string in `layers` as a comment, so this
     must not assume every entry is a dict."""
-    from em_ngl.state import state_url
+    from neu_glance.state import state_url
 
     url = state_url({"layers": ["# a note", {"type": "image", "name": "em"}]})
     cli.main(["parse", url, "--layers"])
@@ -251,24 +251,24 @@ def test_an_unknown_shader_name_is_refused():
 # --------------------------------------------------------------------------- #
 # the import contract
 # --------------------------------------------------------------------------- #
-def test_importing_the_package_does_not_pull_in_em_volume_tools():
+def test_importing_the_package_does_not_pull_in_neu_vol():
     """`cli` reads __version__ from __init__, so an eager import there would make every
-    `em-ngl --help` pay for tensorstore. The lazy exports are what keep it cheap."""
+    `neu-glance --help` pay for tensorstore. The lazy exports are what keep it cheap."""
     import subprocess
     import sys
 
-    code = ("import sys, em_ngl; "
-            "assert 'em_volume_tools' not in sys.modules; "
+    code = ("import sys, neu_glance; "
+            "assert 'neu_vol' not in sys.modules; "
             "assert 'numpy' not in sys.modules; "
-            "assert em_ngl.build_state")
+            "assert neu_glance.build_state")
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
-def test_building_the_parser_does_not_pull_in_em_volume_tools():
+def test_building_the_parser_does_not_pull_in_neu_vol():
     import subprocess
     import sys
 
-    code = ("import sys; from em_ngl import cli; cli.build_parser(); "
-            "assert 'em_volume_tools' not in sys.modules, "
-            "'building the parser imported em_volume_tools'")
+    code = ("import sys; from neu_glance import cli; cli.build_parser(); "
+            "assert 'neu_vol' not in sys.modules, "
+            "'building the parser imported neu_vol'")
     subprocess.run([sys.executable, "-c", code], check=True)

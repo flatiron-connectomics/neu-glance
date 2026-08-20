@@ -2,7 +2,7 @@
 
 **Pure.** Everything here takes plain data and returns plain data — no store access, no
 network, no volume opening. That is what lets the whole layer format be tested without a
-fixture, and it is why the occupancy *analysis* stayed in em-volume-tools
+fixture, and it is why the occupancy *analysis* stayed in neu-vol
 (``ops.annotate.labeled_regions``) while only the JSON emission moved here: the analysis
 needs a store, this does not.
 
@@ -13,7 +13,7 @@ defines ``[Symbol.iterator]`` as an empty generator. A precomputed annotation la
 renders in the viewport but contributes no rows to the Annotations tab: no list to click
 through, and ``[`` / ``]`` do not step. Local annotations, carried inline in the state, list
 and navigate. For a set too large to carry inline — synapses over a whole volume — the
-precomputed format is the answer and :mod:`em_ngl.sources` addresses it; the two are
+precomputed format is the answer and :mod:`neu_glance.sources` addresses it; the two are
 complementary rather than alternatives.
 
 Coordinates are **zyx in memory** throughout, converted to xyz in exactly one place —
@@ -222,7 +222,7 @@ def boxes_layer(regions: list[dict], dims: dict, *, name: str = "regions",
     :func:`build_annotation`, as it does for every annotation this module writes.
 
     Named ``boxes_layer`` rather than ``annotation_layer`` because
-    :func:`em_ngl.sources.annotation_layer` builds a layer for a *precomputed annotation
+    :func:`neu_glance.sources.annotation_layer` builds a layer for a *precomputed annotation
     source* — a different thing that took the same name in the module this came from.
     """
     annotations = []
@@ -254,7 +254,7 @@ def render(obj: Any) -> str:
                 # Plain ASCII on purpose. json.dumps escapes control characters, so a
                 # NUL sentinel is written out as a six-character escape sequence, and
                 # the substitution below then misses every one of them silently.
-                key = f"__em_ngl_annotation_{len(holes)}__"
+                key = f"__neu_glance_annotation_{len(holes)}__"
                 holes[key] = json.dumps(o, separators=(", ", ": "))
                 return key
             return {k: fold(v) for k, v in o.items()}

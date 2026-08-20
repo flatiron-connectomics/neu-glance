@@ -1,14 +1,14 @@
-# em-ngl
+# neu-glance
 
 Neuroglancer viewer states, annotation layers and shareable links.
 
 Everything that produces something a **viewer** consumes, and nothing that produces data.
-em-volume-tools writes volumes, em-annotation writes precomputed annotation sources, and
+neu-vol writes volumes, neu-mark writes precomputed annotation sources, and
 neither of them knows a viewer exists — so a shader that reads a synapse property lives here
 rather than being pushed down into whichever library happens to own the store access.
 
 ```bash
-em-ngl gen --image s3://bucket/em --seg s3://bucket/seg_v1 \
+neu-glance gen --image s3://bucket/em --seg s3://bucket/seg_v1 \
     --annotations s3://bucket/seg_v1/synapses_v1 --annotation-split --segments 12345
 ```
 
@@ -16,11 +16,11 @@ em-ngl gen --image s3://bucket/em --seg s3://bucket/seg_v1 \
 
 | | produces |
 | --- | --- |
-| `em-ngl gen` | a **state** from volumes, annotation sources and layer files |
-| `em-ngl annotate` | a **layer** from coordinates or a CSV |
-| `em-ngl bboxes` | a **layer** from a volume's occupancy |
-| `em-ngl parse` | a URL back into its state JSON |
-| `em-ngl shaders` | lists or prints the built-in annotation shaders |
+| `neu-glance gen` | a **state** from volumes, annotation sources and layer files |
+| `neu-glance annotate` | a **layer** from coordinates or a CSV |
+| `neu-glance bboxes` | a **layer** from a volume's occupancy |
+| `neu-glance parse` | a URL back into its state JSON |
+| `neu-glance shaders` | lists or prints the built-in annotation shaders |
 
 The three producers share one output stage. `--format {layer,state,url}` chooses the
 serialization — a bare layer to paste into a state's `layers` array, a whole state for
@@ -54,12 +54,12 @@ the four worth knowing up front:
 ## Layout
 
 ```
-em_ngl/
+neu_glance/
 ├── layers.py    local annotation layers — from coordinates, or from occupancy boxes
 ├── sources.py   layers for something on a store: a volume, an annotation source
 ├── shaders.py   GLSL, and the rule for choosing one
 ├── state.py     assemble a state, encode a URL, read one back, merge into one
-└── cli.py       em-ngl
+└── cli.py       neu-glance
 ```
 
 `layers.py` and `state.py` are **pure** — plain data in, plain data out, no store access —
@@ -69,10 +69,10 @@ require one.
 
 ## Install
 
-Part of the `em-lib` conda environment, installed editable alongside its siblings:
+Part of the `neu-env` conda environment, installed editable alongside its siblings:
 
 ```bash
-pip install --no-deps -e ./em-ngl
+pip install --no-deps -e ./neu-glance
 ```
 
-`--no-deps` is load-bearing across this family — see the em-libraries notes.
+`--no-deps` is load-bearing across this family — see the neu-suite notes.

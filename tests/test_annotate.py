@@ -1,4 +1,4 @@
-"""`em-ngl annotate`: a local annotation layer from coordinates the caller supplies.
+"""`neu-glance annotate`: a local annotation layer from coordinates the caller supplies.
 
 The assertions that matter are the ones about *where* an annotation ends up, because a
 misplaced annotation is a perfectly valid annotation: the zyx -> xyz flip, and the unit
@@ -10,11 +10,11 @@ import json
 import numpy as np
 import pytest
 
-from em_volume_tools import convert
-from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.profiles import zarr3_create_spec
+from neu_vol import convert
+from neu_vol.backends.tensorstore import TensorStoreBackend
+from neu_vol.profiles import zarr3_create_spec
 
-from em_ngl import cli, layers as _layers
+from neu_glance import cli, layers as _layers
 
 
 @pytest.fixture
@@ -220,7 +220,7 @@ def test_out_writes_the_layer(tmp_path, volume, capsys):
 
 def test_the_layer_composes_with_gen(tmp_path, volume, capsys):
     """The whole point of emitting a layer: `gen --layer` inlines it."""
-    from em_ngl.state import parse_url
+    from neu_glance.state import parse_url
 
     out = tmp_path / "layer.json"
     cli.main(["annotate", "--volume", volume, "--point", "8,8,8",
@@ -236,8 +236,8 @@ def test_the_layer_composes_with_gen(tmp_path, volume, capsys):
 def test_the_cli_column_spec_matches_the_layers_one():
     """The parser needs the columns at build time, so cli.py repeats them.
 
-    Importing `layers` at parser-build time would pull em-volume-tools into every
-    `em-ngl --help`, so the duplication stays — and this is what keeps it from drifting.
+    Importing `layers` at parser-build time would pull neu-vol into every
+    `neu-glance --help`, so the duplication stays — and this is what keeps it from drifting.
     """
     assert cli._ANN_CSV_COLUMNS == _layers.CSV_COLUMNS
     assert {k for _p, k in cli._ANN_FLAGS} == set(_layers.KINDS)

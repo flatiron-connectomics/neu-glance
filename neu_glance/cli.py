@@ -1,6 +1,6 @@
-"""``em-ngl`` — the command line over em_ngl.
+"""``neu-glance`` — the command line over neu_glance.
 
-Argparse, matching its siblings (`em-vol`, `em-morpho`, `em-annot`) rather than introducing a
+Argparse, matching its siblings (`neu-vol`, `neu-morpho`, `neu-mark`) rather than introducing a
 second CLI framework into the family. Heavy imports stay inside the subcommand that needs them
 so ``--help`` is fast.
 
@@ -31,8 +31,8 @@ _ANN_FLAGS = (("points", "point"), ("boxes", "box"), ("lines", "line"),
               ("ellipsoids", "ellipsoid"))
 
 #: The same column spec as ``layers.CSV_COLUMNS``, repeated here because the parser needs it at
-#: build time and importing the module at parser-build time would pull em-volume-tools into
-#: every ``em-ngl --help``. A test asserts the two agree, which is what keeps the duplication
+#: build time and importing the module at parser-build time would pull neu-vol into
+#: every ``neu-glance --help``. A test asserts the two agree, which is what keeps the duplication
 #: honest.
 _ANN_CSV_COLUMNS = {
     "point": (("z", "y", "x"),),
@@ -65,7 +65,7 @@ def _write_text(path: str, text: str) -> None:
     Through ``location`` rather than ``open()`` so ``--out s3://…`` works: the file driver
     creates parent directories and the s3 driver bootstraps credentials.
     """
-    from em_volume_tools.location import write_bytes
+    from neu_vol.location import write_bytes
 
     write_bytes(path, text.encode())
 
@@ -74,7 +74,7 @@ def _read_ann_file(path: str) -> str:
     """CSV text from a path, an object-store URL, or ``-`` for stdin."""
     if path == "-":
         return sys.stdin.read()
-    from em_volume_tools.location import read_bytes
+    from neu_vol.location import read_bytes
 
     data = read_bytes(path)
     if data is None:
@@ -118,7 +118,7 @@ def _volume_frame(volume: str | None, voxel_size: str | None):
     if not volume:
         return voxel, ("nm" if voxel else None), None
 
-    from em_volume_tools.source_metadata import detect_backend, read_source_metadata
+    from neu_vol.source_metadata import detect_backend, read_source_metadata
 
     from .sources import volume_extent
 
@@ -138,7 +138,7 @@ def _level0_factor(volume: str, scale: int) -> tuple[int, ...]:
     Read from each level's OWN recorded voxel size, never ``2**scale``: real pyramids are
     anisotropic and ``(1, 2, 2)`` — halve x/y, leave z — is common.
     """
-    from em_volume_tools.source_metadata import (detect_backend, location_spec,
+    from neu_vol.source_metadata import (detect_backend, location_spec,
                                                  read_level_voxel_sizes)
 
     fmt = detect_backend(volume.rstrip("/"))
@@ -230,8 +230,8 @@ def _emit(args, layers: list[dict], *, voxel=None, units=None, frame=None,
           selected: str | None = None) -> int:
     """Serialize ``layers`` per ``--format``/``--into``/``--out``. Returns an exit code.
 
-    One implementation for all three producers, which is what keeps ``em-ngl bboxes --format
-    url`` and ``em-ngl gen`` from drifting into two different notions of a state.
+    One implementation for all three producers, which is what keeps ``neu-glance bboxes --format
+    url`` and ``neu-glance gen`` from drifting into two different notions of a state.
     """
     from .layers import render
     from .state import LONG_URL, StateProblem, load_state, merge_into, state_url
@@ -314,17 +314,17 @@ def _emit(args, layers: list[dict], *, voxel=None, units=None, frame=None,
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="em-ngl",
+        prog="neu-glance",
         description="Neuroglancer states, layers and links.\n\n"
                     "Everything a viewer consumes and nothing that produces data: the "
-                    "volumes come from em-volume-tools and the annotation sources from "
-                    "em-annotation, and neither of those knows a viewer exists.\n\n"
+                    "volumes come from neu-vol and the annotation sources from "
+                    "neu-mark, and neither of those knows a viewer exists.\n\n"
                     "Neuroglancer keeps its whole state in the URL fragment, so a link IS "
                     "the state. Everything after '#!' stays in the browser and is never "
                     "sent to a server — but the whole state travels in the URL, so a large "
                     "inline annotation layer makes for a long one.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--version", action="version", version=f"em-ngl {__version__}")
+    p.add_argument("--version", action="version", version=f"neu-glance {__version__}")
     sub = p.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     # --- gen ----------------------------------------------------------------
@@ -335,8 +335,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "right, which is the part that fails silently by hand: a `dimensions` "
                     "block that disagrees with the data loads fine and puts every layer in "
                     "the wrong place.\n\n"
-                    "  em-ngl bboxes s3://.../gt_v2 --label gt --out gt.json\n"
-                    "  em-ngl gen --image s3://.../em --seg s3://.../gt_v2 \\\n"
+                    "  neu-glance bboxes s3://.../gt_v2 --label gt --out gt.json\n"
+                    "  neu-glance gen --image s3://.../em --seg s3://.../gt_v2 \\\n"
                     "      --layer gt.json --segments 1,2,3 --layout xy-3d\n\n"
                     "URL or JSON to stdout, summary to stderr. Reads only.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -348,7 +348,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="comma-separated segment ids to select, applied to the --seg "
                         "volumes in order. Repeat for a second segmentation")
     q.add_argument("--annotations", action="append", metavar="SOURCE",
-                   help="a precomputed ANNOTATION source — what `em-annot "
+                   help="a precomputed ANNOTATION source — what `neu-mark "
                         "annotation-source` writes (repeatable). Added as its own layer, "
                         "because unlike mesh and skeletons an annotation source is never "
                         "named in a volume's info. Its relationships are bound to the first "
@@ -375,7 +375,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "way")
     q.add_argument("--layer", action="append", metavar="PATH_OR_URL",
                    help="a JSON file holding a layer, or a state whose layers are taken — "
-                        "e.g. the output of `em-ngl bboxes` (repeatable)")
+                        "e.g. the output of `neu-glance bboxes` (repeatable)")
     q.add_argument("--image-opacity", type=float, default=None, metavar="F",
                    help="opacity for the --image layers")
     q.add_argument("--voxel-size", default=None, metavar="Z,Y,X",
@@ -394,8 +394,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "The annotations are LOCAL, carried inline in the state, and that is "
                     "the point: only local annotations appear in the Annotations tab, which "
                     "is what makes them clickable and steppable. For a whole volume's worth "
-                    "of synapses, write a precomputed source with `em-annot "
-                    "annotation-source` and add it with `em-ngl gen --annotations`.\n\n"
+                    "of synapses, write a precomputed source with `neu-mark "
+                    "annotation-source` and add it with `neu-glance gen --annotations`.\n\n"
                     "Coordinates are zyx and in level-0 voxels unless --scale or --nm says "
                     "otherwise.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -434,7 +434,7 @@ def build_parser() -> argparse.ArgumentParser:
                     "chunk objects exist — TensorStore never persists an all-fill chunk, so "
                     "the set of present keys IS the occupied footprint — then tightening "
                     "each box to its nonzero voxels at a coarse level.\n\n"
-                    "The analysis lives in em-volume-tools (`ops.annotate.labeled_regions`); "
+                    "The analysis lives in neu-vol (`ops.annotate.labeled_regions`); "
                     "this turns its answer into a layer.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     q.add_argument("volume", help="the volume to inspect (path or s3://…)")
@@ -688,7 +688,7 @@ def cmd_annotate(args) -> int:
 
 def cmd_bboxes(args) -> int:
     """A layer of boxes over a sparse volume's occupied regions."""
-    from em_volume_tools.ops.annotate import NoOccupancy, labeled_regions
+    from neu_vol.ops.annotate import NoOccupancy, labeled_regions
 
     from .layers import boxes_layer, output_dimensions
 

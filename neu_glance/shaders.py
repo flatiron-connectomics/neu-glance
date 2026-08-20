@@ -2,8 +2,8 @@
 
 **A shader lives in the viewer state, not in the source**, so a link is the only place one
 can be shipped — which is why these live here rather than in whatever wrote the annotations.
-That separation is also the reason this package exists: the writer (`em-annot
-annotation-source`) has no business carrying a shader, and em-volume-tools has no business
+That separation is also the reason this package exists: the writer (`neu-mark
+annotation-source`) has no business carrying a shader, and neu-vol has no business
 knowing what a synapse is.
 
 The one hard rule: **a shader naming a `prop_` the source does not declare fails to compile,
@@ -103,7 +103,7 @@ def pick_shader(info: Mapping[str, Any], name: str | None,
     ``prop_`` does not degrade: it fails to compile and the layer draws nothing.
 
     ``read_bytes`` is injected so this module needs no store access of its own; the CLI passes
-    :func:`em_volume_tools.location.read_bytes`.
+    :func:`neu_vol.location.read_bytes`.
     """
     declared = {p["id"] for p in info.get("properties", []) or []}
     if name == "none":
@@ -127,7 +127,7 @@ def pick_shader(info: Mapping[str, Any], name: str | None,
 
     reader = read_bytes
     if reader is None:
-        from em_volume_tools.location import read_bytes as reader
+        from neu_vol.location import read_bytes as reader
 
     raw = reader(name)
     if raw is None:

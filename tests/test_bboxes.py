@@ -1,6 +1,6 @@
-"""`em-ngl bboxes`: a layer from where a sparse volume's data actually is.
+"""`neu-glance bboxes`: a layer from where a sparse volume's data actually is.
 
-The occupancy analysis itself lives in em-volume-tools and is tested there; what these check
+The occupancy analysis itself lives in neu-vol and is tested there; what these check
 is the turn from boxes into a layer. The weight is on the zyx/xyz flip, because getting it
 wrong mirrors every annotation through the z=x diagonal and still produces a layer that loads.
 """
@@ -11,12 +11,12 @@ import os
 import numpy as np
 import pytest
 
-from em_volume_tools import convert
-from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.profiles import zarr3_create_spec
+from neu_vol import convert
+from neu_vol.backends.tensorstore import TensorStoreBackend
+from neu_vol.profiles import zarr3_create_spec
 
-from em_ngl import cli
-from em_ngl.layers import boxes_layer, output_dimensions, render
+from neu_glance import cli
+from neu_glance.layers import boxes_layer, output_dimensions, render
 
 
 def _sparse(tmp_path, name, *, profile, chunk=(8, 8, 8)):
@@ -98,7 +98,7 @@ def test_render_stays_valid_json_with_one_line_per_annotation():
     layer = boxes_layer(regions, {d: [8e-9, "m"] for d in "xyz"})
     text = render(layer)
 
-    assert "\\u0000" not in text and "em_ngl_annotation" not in text
+    assert "\\u0000" not in text and "neu_glance_annotation" not in text
     back = json.loads(text)
     assert [a["type"] for a in back["annotations"]] == \
         ["axis_aligned_bounding_box"] * 2
@@ -161,7 +161,7 @@ def test_label_and_name_flow_through(tmp_path, capsys):
 
 def test_an_empty_volume_reports_nothing_to_annotate(tmp_path, capsys):
     """Distinguishable from a failure: exit 1, and it says why."""
-    from em_volume_tools.ops.create import create_volume
+    from neu_vol.ops.create import create_volume
 
     dst = str(tmp_path / "empty")
     create_volume(dst, format="precomputed", shape=(32, 32, 32), dtype="uint64",
