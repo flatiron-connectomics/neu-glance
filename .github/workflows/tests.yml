@@ -23,9 +23,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Sibling packages, not on PyPI. Both are public, so no token is needed — but pip
+      # Sibling packages, not on PyPI. All are public, so no token is needed — but pip
       # would still try PyPI for the `neu-vol` requirement, so they have to be
       # installed from source FIRST, and in dependency order.
+      - uses: actions/checkout@v7
+        with:
+          repository: flatiron-connectomics/neu-lib
+          path: .siblings/neu-lib
+
       - uses: actions/checkout@v7
         with:
           repository: flatiron-connectomics/blockrun
@@ -47,7 +52,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install ./.siblings/blockrun ./.siblings/neu-vol
+          pip install ./.siblings/neu-lib ./.siblings/blockrun ./.siblings/neu-vol
           pip install -e ".[dev]"
 
       - name: Test
