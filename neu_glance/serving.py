@@ -82,16 +82,141 @@ class ServedLayer:
     origin dropped here puts the crop at nm zero, which is correct for a whole volume and
     wrong for every box out of one, with nothing to show for it.
 
-    ``channel_axis`` marks a leading channel axis (a 3-channel probability map). The
-    package convention is channel-first, matching ``has_channels`` elsewhere.
+    ``channel_axis`` marks a leading channel axis (a 3-channel probability map) and is
+    **derived from the array's rank** — a served volume is 3 spatial axes, so 4-D means a
+    channel axis and 3-D means none, and there is no third possibility to choose between.
+    Passing it is allowed and checked; passing it *wrong* is the one thing it can do, which
+    is why it is not asked for. The package convention is channel-first, matching
+    ``has_channels`` elsewhere.
     """
     array: Any
     kind: str = "image"
     name: str | None = None
     frame: Any = None
     shader: str | None = None
-    channel_axis: bool = False
+    channel_axis: bool | None = None
     opacity: float | None = None
+
+    # ------------------------------------------------------------ constructors
+    #
+    # The rule these follow, and it is one line: **infer what the source RECORDS, require
+    # what it does not.** A frame, a dataset name and a channel axis are all facts written
+    # down somewhere — in an HDF5 file's attributes, a precomputed `info`, or the array's
+    # own shape — so reading them is not guessing and dropping them is the silent failure.
+    # `kind` is different: an HDF5 file has nowhere agreed-on to say it, and deciding from
+    # the dtype is exactly the mistake `volume_type` exists to override, so it is asked for
+    # rather than inferred. A volume that records `info["type"]` is the exception, because
+    # there the answer is written down too.
+
+    @classmethod
+    def from_array(cls, array: Any, kind: str, *, name: str | None = None,
+                   frame: Any = None, voxel_size: Sequence[float] | None = None,
+                   origin: Sequence[float] | None = None,
+                   channel_axis: bool | None = None, **kwargs) -> "ServedLayer":
+        """An in-memory array. ``voxel_size``/``origin`` build the frame for you.
+
+            ServedLayer.from_array(prob, "probability", voxel_size=(40, 8, 8))
+
+        ``channel_axis`` comes from the array's rank, which is a fact about its shape
+        rather than a guess — see :class:`ServedLayer`.
+        """
+        from neu_lib import Frame
+
+        if frame is None and voxel_size is not None:
+            frame = Frame(voxel_size_nm=tuple(float(v) for v in voxel_size),
+                          origin_nm=tuple(float(o) for o in (origin or (0.0, 0.0, 0.0))))
+        elif frame is not None and (voxel_size is not None or origin is not None):
+            raise ServeProblem(
+                "pass either frame= or voxel_size=/origin=, not both — two frames for one "
+                "array is a disagreement nothing here can resolve")
+        return cls(array=array, kind=kind, name=name, frame=frame,
+                   channel_axis=channel_axis, **kwargs)
+
+    @classmethod
+    def from_hdf5(cls, path: str, dataset: str | None = None, kind: str | None = None, *,
+                  crop: Any = None, name: str | None = None,
+                  voxel_size: Sequence[float] | None = None, **kwargs) -> "ServedLayer":
+        """One dataset of an HDF5 file, with the frame it records about itself.
+
+            ServedLayer.from_hdf5("piece.h5", kind="segmentation")
+            ServedLayer.from_hdf5("gt.h5", "/z07901", "segmentation")
+
+        ``dataset`` is optional when the file holds exactly one 3D+ array; with several the
+        error lists them. The frame comes from the file's own ``voxel_size`` / ``axes`` /
+        ``voxel_offset`` attributes — which is what ``neu-vol to-hdf5`` writes, so a piece
+        this suite produced needs no coordinates retyped. ``voxel_size`` overrides, and is
+        required for a file that records none.
+
+        ``kind`` is required: an HDF5 file has nowhere agreed-on to record it, and reading
+        it off the dtype is the mistake that shows uint8 labels as an image.
+
+        The format is forced rather than detected, so a file whose extension detection does
+        not recognise still opens.
+        """
+        return cls._from_read(
+            _read_source(path, dataset, "hdf5", level=0, crop=crop,
+                         voxel_size=voxel_size),
+            path=path, kind=kind, name=name, **kwargs)
+
+    @classmethod
+    def from_volume(cls, volume: str, kind: str | None = None, *, level: int = 0,
+                    crop: Any = None, name: str | None = None,
+                    voxel_size: Sequence[float] | None = None,
+                    **kwargs) -> "ServedLayer":
+        """A box out of a stored volume — zarr, precomputed, an image stack.
+
+            ServedLayer.from_volume("s3://my-bucket/seg_v1", level=1,
+                                    crop=((0, 0, 0), (64, 512, 512)))
+
+        ``kind`` is taken from what the volume records (precomputed's ``info["type"]``,
+        OME's multiscales ``type``) and is only required where it records nothing. That is
+        not inference: it is the same field ``neu-vol copy`` exists to preserve, and
+        overriding it silently is what averages label ids into ids that were never in the
+        data.
+
+        A whole volume is usually far too large to hold in memory — pass ``crop``.
+        """
+        return cls._from_read(
+            _read_source(volume, None, None, level=level, crop=crop,
+                         voxel_size=voxel_size),
+            path=volume, kind=kind, name=name, **kwargs)
+
+    @classmethod
+    def from_source(cls, src: str, kind: str | None = None, *, level: int = 0,
+                    crop: Any = None, name: str | None = None,
+                    voxel_size: Sequence[float] | None = None,
+                    **kwargs) -> "ServedLayer":
+        """Anything readable, addressed as ``PATH`` or ``PATH:/DATASET``.
+
+        The form the CLI takes, and the one to reach for when the source could be either —
+        the format is detected, and a trailing ``:/name`` selects an array inside an HDF5
+        container. Only a **leading slash** makes it a dataset, so a scheme's own colon
+        (``s3://…``) is left alone.
+        """
+        path, _, dataset = src.partition(":")
+        if not dataset.startswith("/"):
+            path, dataset = src, ""
+        return cls._from_read(
+            _read_source(path, dataset or None, None, level=level, crop=crop,
+                         voxel_size=voxel_size),
+            path=path, kind=kind, name=name, **kwargs)
+
+    @classmethod
+    def _from_read(cls, read: dict, *, path: str, kind: str | None,
+                   name: str | None, **kwargs) -> "ServedLayer":
+        """Assemble a layer from :func:`_read_source`'s result. Shared by the three above."""
+        kind = kind or read["kind"]
+        if kind is None:
+            raise ServeProblem(
+                f"{path} records no image/segmentation type, so kind= is required — one of "
+                f"{', '.join(KINDS)}. It is not inferred from the dtype: neuroglancer's own "
+                f"guess reads a uint8 label array as an image, which averages label ids on "
+                f"downsample and loses the colour hashing and the selection UI. (A "
+                f"precomputed volume records the type in its `info`, and then this is not "
+                f"needed.)")
+        return cls(array=read["array"], kind=kind,
+                   name=name or _default_name(path, read["dataset"]),
+                   frame=read["frame"], channel_axis=read["channel_axis"], **kwargs)
 
     def __post_init__(self) -> None:
         if self.kind not in KINDS:
@@ -100,12 +225,117 @@ class ServedLayer:
             raise ServeProblem(
                 f"layer {self.name!r}: expected an array with .shape and .dtype, got "
                 f"{type(self.array).__name__}")
-        spatial = len(self.array.shape) - (1 if self.channel_axis else 0)
-        if spatial != 3:
+        rank = len(self.array.shape)
+        if rank not in (3, 4):
             raise ServeProblem(
-                f"layer {self.name!r}: {len(self.array.shape)}-D array "
-                f"{tuple(self.array.shape)} is {spatial} spatial axes; a served volume is "
-                f"3, optionally with a leading channel axis (pass channel_axis=True)")
+                f"layer {self.name!r}: a served volume is 3 spatial axes, optionally with "
+                f"a leading channel axis, so 3-D or 4-D — got {rank}-D "
+                f"{tuple(self.array.shape)}")
+        derived = rank == 4
+        if self.channel_axis is None:
+            self.channel_axis = derived
+        elif bool(self.channel_axis) != derived:
+            raise ServeProblem(
+                f"layer {self.name!r}: channel_axis={self.channel_axis} contradicts a "
+                f"{rank}-D array {tuple(self.array.shape)}, which has "
+                f"{'a' if derived else 'no'} leading channel axis. Leave it out — the rank "
+                f"decides it")
+
+
+def _read_source(path: str, dataset: str | None, fmt: str | None, *, level: int,
+                 crop: Any, voxel_size: Any) -> dict:
+    """Read one source and everything known about it. The shared half of the constructors.
+
+    Returns ``{array, frame, channel_axis, kind, why}`` — ``kind`` being whatever the
+    source *records*, or ``None`` when it records nothing and inference has to decide.
+    A precomputed volume records it in ``info["type"]``, which is authoritative and must
+    never be second-guessed: getting it wrong averages label ids into ids that were never
+    in the data. An HDF5 file has nowhere agreed-on to say, so it records nothing.
+
+    The frame travels with the array, and a crop shifts its origin — which is what keeps a
+    served box on top of the volume it came from rather than at nm zero (invariant 1).
+    """
+    from neu_lib import Frame
+    from neu_vol import describe, open_backend
+    from neu_vol.source_metadata import (level_spec, location_spec,
+                                         read_level_voxel_sizes, read_source_metadata,
+                                         require_one_array)
+
+    if fmt is None:
+        described = describe(path, dataset=dataset or None)
+        if described["shape"] is None:
+            require_one_array(described, path, "neu-glance serve")
+        fmt, spec, meta = described["format"], described["spec"], described["meta"] or {}
+        dataset = described.get("dataset") or dataset
+    else:
+        # A format named outright, for a file whose name detection would not recognise.
+        spec = location_spec(path, fmt, dataset=dataset or None)
+        meta = read_source_metadata(spec) or {}
+        dataset = spec.get("dataset") or dataset
+
+    single = fmt in ("hdf5", "image_stack")
+    if level and single:
+        raise ServeProblem(
+            f"level {level} needs a multiscale volume; {path} is {fmt}, a single array")
+    read_spec = spec if (single or not level) else level_spec(
+        path, fmt, level, dataset=dataset or None)
+
+    backend = open_backend(read_spec)
+    shape = tuple(int(s) for s in backend.shape)
+    per_level = read_level_voxel_sizes(spec) or []
+    voxel = (tuple(voxel_size) if voxel_size
+             else (tuple(per_level[level]) if level < len(per_level) else None)
+             or (tuple(meta["voxel_size"]) if meta.get("voxel_size") else None))
+    if voxel is None:
+        raise ServeProblem(
+            f"{path} records no voxel size, so nothing here knows its physical scale; "
+            f"pass voxel_size=(z, y, x)")
+
+    channel_axis = len(shape) == 4
+    spatial = shape[1:] if channel_axis else shape
+    lo = (0, 0, 0)
+    if crop:
+        lo, hi = (tuple(crop[0]), tuple(crop[1]))
+        for axis, (start, stop, extent) in enumerate(zip(lo, hi, spatial)):
+            if not 0 <= start < stop <= extent:
+                raise ServeProblem(
+                    f"crop {lo}:{hi} does not fit {path}'s level-{level} extent "
+                    f"{spatial} on axis {axis}")
+        region = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
+    else:
+        region = tuple(slice(0, int(s)) for s in spatial)
+    if channel_axis:
+        region = (slice(0, shape[0]),) + region
+
+    shift = tuple(float(o) * v for o, v in zip(lo, voxel))
+    recorded = tuple(float(o) for o in meta["offset"]) if meta.get("offset") else None
+    if recorded is None:
+        origin = shift
+    else:
+        # A crop out of a piece that already knows where it belongs lands at the SUM, the
+        # same rule `neu-vol to-hdf5 --crop-bbox` follows.
+        origin = tuple(a + b for a, b in zip(recorded, shift))
+
+    return {"array": backend.read_region(region),
+            "frame": Frame(voxel_size_nm=voxel, origin_nm=origin),
+            "channel_axis": channel_axis,
+            "kind": meta.get("kind"),
+            "dataset": dataset,
+            "format": fmt}
+
+
+def _default_name(path: str, dataset: str | None) -> str:
+    """A layer name from a source: the dataset if there is one, else the file stem."""
+    import os
+
+    if dataset:
+        return dataset.strip("/").replace("/", "_") or "layer"
+    stem = os.path.basename(str(path).rstrip("/"))
+    for suffix in (".h5", ".hdf5", ".hdf", ".he5", ".zarr", ".precomputed", ".n5"):
+        if stem.lower().endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    return stem or "layer"
 
 
 @dataclass

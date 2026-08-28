@@ -53,12 +53,27 @@ server runs in **your kernel**, so the browser's state is readable here:
 
 ```python
 from neu_glance import serve, ServedLayer
-srv = serve([ServedLayer(prob, kind="probability", frame=frame)])
+
+layers = [
+    ServedLayer.from_hdf5("gt.h5", "/z07901", "segmentation"),   # frame from the file
+    ServedLayer.from_volume("s3://my-bucket/em", level=1,        # kind from its info
+                            crop=((0, 0, 0), (64, 512, 512))),
+    ServedLayer.from_array(prob, "probability", voxel_size=(40, 8, 8)),
+]
+srv = serve(layers)
 srv                                  # renders the link
 srv.boxes()                          # boxes you drew, as (lo, hi) in zyx voxels
 srv.selected_segments()              # label ids you clicked
 srv.on_click(lambda c: print(c.voxel, c.values))
 ```
+
+The three constructors follow one rule: **infer what the source records, require what it
+does not.** A frame, a dataset name and the channel axis are all written down — in an HDF5
+file's attributes, a precomputed `info`, or the array's own rank — so reading them is not
+guessing, and dropping them is the silent failure. `kind` is asked for, because an HDF5 file
+has nowhere agreed-on to record it and reading it off the dtype is the mistake neuroglancer
+itself makes. A volume that records `info["type"]` is the exception, and then `from_volume`
+needs nothing.
 
 `srv.boxes()` is what closes the loop: pick a region in the viewer, hand it straight to
 `--crop-bbox`, `extract_roi` or `neu-vol write`.

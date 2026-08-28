@@ -161,14 +161,10 @@ def _labels(shape=(8, 16, 16), dtype="uint8"):
 def test_a_bad_kind_or_shape_is_refused_before_anything_is_served():
     with pytest.raises(ServeProblem, match="kind must be"):
         ServedLayer(_labels(), kind="labels")
-    with pytest.raises(ServeProblem, match="spatial axes"):
+    with pytest.raises(ServeProblem, match="3-D or 4-D"):
         ServedLayer(np.zeros((4, 4)), kind="image")
     with pytest.raises(ServeProblem, match="expected an array"):
         ServedLayer([1, 2, 3], kind="image")
-    # 4-D is fine *if* the channel axis is declared
-    ServedLayer(np.zeros((3, 4, 4, 4)), kind="probability", channel_axis=True)
-    with pytest.raises(ServeProblem, match="spatial axes"):
-        ServedLayer(np.zeros((3, 4, 4, 4)), kind="probability")
 
 
 # --- the frame, which is the silent one ------------------------------------- #
@@ -354,96 +350,175 @@ def test_click_position_floors_to_the_voxel_actually_clicked():
     assert Click(position=(1.7, 2.2, 3.9)).voxel == (1, 2, 3)
 
 
-# --- the CLI's source reader ----------------------------------------------- #
-def test_read_array_takes_the_frame_from_an_hdf5_piece(tmp_path):
+# --- the constructors ------------------------------------------------------ #
+#
+# They follow one rule: infer what the source RECORDS, require what it does not. So the
+# tests come in two shapes — a recorded fact must not be dropped, and an unrecorded one
+# must not be guessed.
+
+
+def _piece(tmp_path, name="piece.h5", **attrs):
     h5py = pytest.importorskip("h5py")
-    from neu_glance.cli import _read_array
-
-    path = str(tmp_path / "piece.h5")
-    data = _labels((6, 8, 8), "uint64")
+    path = str(tmp_path / name)
     with h5py.File(path, "w") as f:
-        d = f.create_dataset("data", data=data)
-        d.attrs["voxel_size"] = np.asarray([40.0, 8.0, 8.0])
-        d.attrs["voxel_offset"] = np.asarray([2, 3, 4], "int64")
-        d.attrs["axes"] = "zyx"
+        d = f.create_dataset("data", data=_labels((6, 8, 8), "uint64"))
+        for key, value in attrs.items():
+            d.attrs[key] = value
+    return path
 
-    array, frame, channel_axis = _read_array(path, level=0, crop=None, voxel_size=None)
-    np.testing.assert_array_equal(array, data)
-    assert tuple(frame.voxel_size_nm) == (40.0, 8.0, 8.0)
-    assert tuple(frame.origin_nm) == (80.0, 24.0, 32.0)
-    assert channel_axis is False
+
+def test_from_array_builds_the_frame_for_you():
+    layer = ServedLayer.from_array(_labels(), "segmentation", voxel_size=(40, 8, 8),
+                                   origin=(80, 16, 24))
+    assert layer.kind == "segmentation"
+    assert tuple(layer.frame.voxel_size_nm) == (40.0, 8.0, 8.0)
+    assert tuple(layer.frame.origin_nm) == (80.0, 16.0, 24.0)
+    assert layer.channel_axis is False
+
+
+def test_the_channel_axis_comes_from_the_RANK_and_cannot_disagree_with_it():
+    """A served volume is 3 spatial axes, so 4-D means a channel axis and 3-D means none.
+    There is no third possibility, which makes the flag something a caller can only get
+    wrong — so it is derived, and a contradiction is an error rather than a silent
+    reinterpretation of the axes."""
+    assert ServedLayer.from_array(np.zeros((3, 4, 4, 4)), "probability").channel_axis
+    assert not ServedLayer.from_array(np.zeros((4, 4, 4)), "image").channel_axis
+    assert ServedLayer(np.zeros((3, 4, 4, 4)), kind="probability").channel_axis, \
+        "the plain constructor derives it too"
+    with pytest.raises(ServeProblem, match="contradicts a 4-D array"):
+        ServedLayer.from_array(np.zeros((3, 4, 4, 4)), "probability", channel_axis=False)
+    with pytest.raises(ServeProblem, match="3-D or 4-D"):
+        ServedLayer.from_array(np.zeros((4, 4)), "image")
+
+
+def test_two_frames_for_one_array_is_refused():
+    from neu_lib import Frame
+
+    with pytest.raises(ServeProblem, match="either frame="):
+        ServedLayer.from_array(_labels(), "image",
+                               frame=Frame(voxel_size_nm=(8, 8, 8)),
+                               voxel_size=(4, 4, 4))
+
+
+def test_from_hdf5_takes_the_frame_the_file_records(tmp_path):
+    """`neu-vol to-hdf5` writes these, so a piece this suite produced needs no
+    coordinates retyped — and dropping them is the silent failure."""
+    path = _piece(tmp_path, voxel_size=np.asarray([40.0, 8.0, 8.0]),
+                  voxel_offset=np.asarray([2, 3, 4], "int64"), axes="zyx")
+    layer = ServedLayer.from_hdf5(path, kind="segmentation")
+    assert layer.array.shape == (6, 8, 8)
+    assert tuple(layer.frame.voxel_size_nm) == (40.0, 8.0, 8.0)
+    assert tuple(layer.frame.origin_nm) == (80.0, 24.0, 32.0)
+    assert layer.name == "data", "the dataset names the layer"
+
+
+def test_from_hdf5_needs_a_kind_and_says_why(tmp_path):
+    """An HDF5 file has nowhere agreed-on to record it, and reading it off the dtype is
+    the mistake `volume_type` exists to override."""
+    path = _piece(tmp_path, voxel_size=np.asarray([8.0, 8.0, 8.0]), axes="zyx")
+    with pytest.raises(ServeProblem, match="kind= is required"):
+        ServedLayer.from_hdf5(path)
+    assert ServedLayer.from_hdf5(path, kind="image").kind == "image"
+
+
+def test_from_hdf5_needs_a_voxel_size_when_the_file_records_none(tmp_path):
+    path = _piece(tmp_path)
+    with pytest.raises(ServeProblem, match="records no voxel size"):
+        ServedLayer.from_hdf5(path, kind="image")
+    layer = ServedLayer.from_hdf5(path, kind="image", voxel_size=(30, 6, 6))
+    assert tuple(layer.frame.voxel_size_nm) == (30.0, 6.0, 6.0)
 
 
 def test_a_crop_lands_at_the_sum_of_the_pieces_origin_and_the_box(tmp_path):
     """The same rule `neu-vol to-hdf5 --crop-bbox` follows: a box out of a piece that
     already knows where it belongs goes there, not at the box's own offset."""
-    h5py = pytest.importorskip("h5py")
-    from neu_glance.cli import _read_array
-
-    path = str(tmp_path / "piece.h5")
-    with h5py.File(path, "w") as f:
-        d = f.create_dataset("data", data=_labels((8, 8, 8), "uint64"))
-        d.attrs["voxel_size"] = np.asarray([8.0, 8.0, 8.0])
-        d.attrs["voxel_offset"] = np.asarray([100, 100, 100], "int64")
-        d.attrs["axes"] = "zyx"
-
-    array, frame, _ = _read_array(path, level=0, crop=((1, 2, 3), (5, 6, 7)),
-                                  voxel_size=None)
-    assert array.shape == (4, 4, 4)
-    assert tuple(frame.origin_nm) == (808.0, 816.0, 824.0)   # 100*8 + crop*8
+    path = _piece(tmp_path, voxel_size=np.asarray([8.0, 8.0, 8.0]),
+                  voxel_offset=np.asarray([100, 100, 100], "int64"), axes="zyx")
+    layer = ServedLayer.from_hdf5(path, kind="segmentation",
+                                  crop=((1, 2, 3), (5, 6, 7)))
+    assert layer.array.shape == (4, 4, 4)
+    assert tuple(layer.frame.origin_nm) == (808.0, 816.0, 824.0)   # 100*8 + crop*8
 
 
 def test_a_box_outside_the_extent_is_refused(tmp_path):
-    h5py = pytest.importorskip("h5py")
-    from neu_glance.cli import _read_array
-
-    path = str(tmp_path / "piece.h5")
-    with h5py.File(path, "w") as f:
-        f.create_dataset("data", data=_labels((8, 8, 8), "uint64"))
-
-    with pytest.raises(SystemExit, match="does not fit"):
-        _read_array(path, level=0, crop=((0, 0, 0), (99, 8, 8)),
-                    voxel_size=(8.0, 8.0, 8.0))
-
-
-def test_a_source_with_no_recorded_scale_needs_voxel_size(tmp_path):
-    h5py = pytest.importorskip("h5py")
-    from neu_glance.cli import _read_array
-
-    path = str(tmp_path / "plain.h5")
-    with h5py.File(path, "w") as f:
-        f.create_dataset("data", data=_labels((4, 4, 4), "uint64"))
-
-    with pytest.raises(SystemExit, match="--voxel-size"):
-        _read_array(path, level=0, crop=None, voxel_size=None)
-    array, frame, _ = _read_array(path, level=0, crop=None,
-                                  voxel_size=(30.0, 6.0, 6.0))
-    assert tuple(frame.voxel_size_nm) == (30.0, 6.0, 6.0)
+    path = _piece(tmp_path, voxel_size=np.asarray([8.0, 8.0, 8.0]), axes="zyx")
+    with pytest.raises(ServeProblem, match="does not fit"):
+        ServedLayer.from_hdf5(path, kind="image", crop=((0, 0, 0), (99, 8, 8)))
 
 
 def test_a_multi_dataset_container_must_be_told_which_array(tmp_path):
     h5py = pytest.importorskip("h5py")
-    from neu_glance.cli import _read_array
-
     path = str(tmp_path / "bag.h5")
     with h5py.File(path, "w") as f:
-        f.create_dataset("a", data=_labels((4, 4, 4), "uint64"))
-        f.create_dataset("b", data=_labels((4, 4, 4), "uint64"))
+        for key in ("a", "b"):
+            d = f.create_dataset(key, data=_labels((4, 4, 4), "uint64"))
+            d.attrs["voxel_size"] = np.asarray([8.0, 8.0, 8.0])
+            d.attrs["axes"] = "zyx"
 
-    with pytest.raises(ValueError, match="needs one array"):
-        _read_array(path, level=0, crop=None, voxel_size=(8.0, 8.0, 8.0))
-    array, _, _ = _read_array(path + ":/b", level=0, crop=None,
-                              voxel_size=(8.0, 8.0, 8.0))
-    assert array.shape == (4, 4, 4)
+    with pytest.raises(KeyError, match="2 volumetric datasets"):
+        ServedLayer.from_hdf5(path, kind="segmentation")
+    assert ServedLayer.from_hdf5(path, "/b", "segmentation").name == "b"
 
 
 def test_a_level_on_a_single_array_is_an_error(tmp_path):
-    h5py = pytest.importorskip("h5py")
-    from neu_glance.cli import _read_array
+    path = _piece(tmp_path, voxel_size=np.asarray([8.0, 8.0, 8.0]), axes="zyx")
+    with pytest.raises(ServeProblem, match="needs a multiscale volume"):
+        ServedLayer.from_source(path, "image", level=2)
 
-    path = str(tmp_path / "piece.h5")
-    with h5py.File(path, "w") as f:
-        f.create_dataset("data", data=_labels((4, 4, 4), "uint64"))
 
-    with pytest.raises(SystemExit, match="needs a multiscale volume"):
-        _read_array(path, level=2, crop=None, voxel_size=(8.0, 8.0, 8.0))
+def test_from_source_splits_a_dataset_only_on_a_LEADING_slash(tmp_path):
+    """`s3://…` carries a colon of its own, so only `:/name` selects an array."""
+    path = _piece(tmp_path, voxel_size=np.asarray([8.0, 8.0, 8.0]), axes="zyx")
+    assert ServedLayer.from_source(f"{path}:/data", "image").name == "data"
+    # no leading slash: the whole string is the path, and there is no such file
+    with pytest.raises((ServeProblem, FileNotFoundError)):
+        ServedLayer.from_source(f"{path}:data", "image")
+
+
+def test_from_volume_takes_kind_from_what_the_volume_RECORDS(tmp_path):
+    """precomputed writes it as `info["type"]`. That is the same field `neu-vol copy`
+    exists to preserve, and overriding it silently averages label ids into ids that were
+    never in the data."""
+    from neu_vol import convert
+    from neu_vol.backends.tensorstore import TensorStoreBackend
+    from neu_vol.profiles import zarr3_create_spec
+
+    src = str(tmp_path / "src.zarr")
+    data = _labels((16, 32, 32), "uint32")
+    be = TensorStoreBackend.create(
+        zarr3_create_spec("local", src, data.shape, "uint32",
+                          dimension_names=("z", "y", "x"), chunk=(8, 8, 8)),
+        delete_existing=True)
+    be.write_region(tuple(slice(0, s) for s in data.shape), data)
+    vol = str(tmp_path / "vol")
+    convert(src, vol, voxel_size=(40, 8, 8), kind="segmentation",
+            profile="local-neuroglancer", chunk=(8, 8, 8), factors=[(1, 2, 2)],
+            min_dim=8, delete_existing=True)
+
+    layer = ServedLayer.from_volume(vol)          # no kind passed
+    assert layer.kind == "segmentation"
+    assert tuple(layer.frame.voxel_size_nm) == (40.0, 8.0, 8.0)
+    # an explicit kind still wins
+    assert ServedLayer.from_volume(vol, "image").kind == "image"
+
+
+def test_a_coarser_level_reports_its_OWN_voxel_size(tmp_path):
+    """Never 2**level: real pyramids are anisotropic, and this one halves x/y only."""
+    from neu_vol import convert
+    from neu_vol.backends.tensorstore import TensorStoreBackend
+    from neu_vol.profiles import zarr3_create_spec
+
+    src = str(tmp_path / "src.zarr")
+    be = TensorStoreBackend.create(
+        zarr3_create_spec("local", src, (16, 32, 32), "uint32",
+                          dimension_names=("z", "y", "x"), chunk=(8, 8, 8)),
+        delete_existing=True)
+    be.write_region(tuple(slice(0, s) for s in (16, 32, 32)),
+                    _labels((16, 32, 32), "uint32"))
+    vol = str(tmp_path / "vol")
+    convert(src, vol, voxel_size=(40, 8, 8), kind="segmentation",
+            profile="local-neuroglancer", chunk=(8, 8, 8), factors=[(1, 2, 2)],
+            min_dim=8, delete_existing=True)
+
+    assert tuple(ServedLayer.from_volume(vol, level=1).frame.voxel_size_nm) \
+        == (40.0, 16.0, 16.0)

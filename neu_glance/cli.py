@@ -864,85 +864,6 @@ def cmd_parse(args) -> int:
     return 0
 
 
-def _read_array(src: str, *, level: int, crop, voxel_size):
-    """One ``--image``/``--seg``/``--prob`` source as ``(array, frame, channel_axis)``.
-
-    ``src`` is ``PATH`` or ``PATH:DATASET``, the second form naming an array inside an
-    HDF5 container. Reading goes through neu-vol — its backends already handle every
-    format this suite can read, and its `describe` already resolves a container's sole
-    dataset or lists the alternatives.
-
-    The **frame travels with the array**, and where a crop is taken the frame's origin
-    shifts by the crop start. That is what keeps a served box on top of the volume it came
-    from rather than at nm zero (CLAUDE.md invariant 1); dropping it is silent.
-    """
-    from neu_lib import Frame
-    from neu_vol import describe, open_backend
-    from neu_vol.source_metadata import level_spec, read_level_voxel_sizes
-
-    path, _, dataset = src.partition(":")
-    # A Windows-style or scheme-ish colon is not a dataset. Only a leading slash is, which
-    # is how every dataset path in this suite is written.
-    if dataset and not dataset.startswith("/"):
-        path, dataset = src, ""
-    try:
-        described = describe(path, dataset=dataset or None)
-    except FileNotFoundError as e:
-        raise SystemExit(str(e)) from None
-    except KeyError as e:
-        # An HDF5 container listing its datasets; the message is the useful part.
-        raise SystemExit(str(e.args[0] if e.args else e)) from None
-    if described["shape"] is None:
-        from neu_vol.source_metadata import require_one_array
-
-        require_one_array(described, path, "neu-glance serve")
-
-    fmt = described["format"]
-    spec = (described["spec"] if level == 0 or fmt in ("hdf5", "image_stack")
-            else level_spec(path, fmt, level, dataset=dataset or None))
-    if level and fmt in ("hdf5", "image_stack"):
-        raise SystemExit(f"--level {level} needs a multiscale volume; {path} is {fmt}, "
-                         f"which is a single array")
-    backend = open_backend(spec)
-    shape = tuple(int(s) for s in backend.shape)
-
-    meta = described["meta"] or {}
-    per_level = read_level_voxel_sizes(described["spec"]) or []
-    voxel = (voxel_size or (tuple(per_level[level]) if level < len(per_level) else None)
-             or meta.get("voxel_size"))
-    if voxel is None:
-        raise SystemExit(
-            f"{path} records no voxel size, so nothing here knows its physical scale; "
-            f"pass --voxel-size z,y,x")
-
-    channel_axis = len(shape) == 4
-    spatial = shape[1:] if channel_axis else shape
-    lo = (0,) * 3
-    if crop:
-        lo, hi = crop
-        for a, (start, stop, extent) in enumerate(zip(lo, hi, spatial)):
-            if not 0 <= start < stop <= extent:
-                raise SystemExit(
-                    f"--crop-bbox {lo}:{hi} does not fit {path}'s level-{level} extent "
-                    f"{spatial} on axis {a}")
-        region = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
-    else:
-        region = tuple(slice(0, int(s)) for s in spatial)
-    if channel_axis:
-        region = (slice(0, shape[0]),) + region
-
-    array = backend.read_region(region)
-    origin = tuple(float(o) * v for o, v in zip(lo, voxel))
-    recorded = meta.get("offset")
-    if recorded and not crop:
-        origin = tuple(float(o) for o in recorded)
-    elif recorded and crop:
-        # A crop out of a piece that already knows where it belongs lands at the SUM, the
-        # same rule `neu-vol to-hdf5 --crop-bbox` follows.
-        origin = tuple(float(o) + s for o, s in zip(recorded, origin))
-    return array, Frame(voxel_size_nm=tuple(voxel), origin_nm=origin), channel_axis
-
-
 def cmd_serve(args) -> int:
     """Host the given arrays and run a viewer on them until interrupted."""
     from .serving import ServedLayer, ServeProblem, _neuroglancer, serve
@@ -965,14 +886,23 @@ def cmd_serve(args) -> int:
 
     layers = []
     for src, kind in requested:
-        array, frame, channel_axis = _read_array(
-            src, level=args.level, crop=crop, voxel_size=voxel_size)
-        name = src.rsplit("/", 1)[-1].replace(":", "").replace(".h5", "") or kind
-        print(f"  {kind:13} {src}  {array.shape} {array.dtype}  "
-              f"voxel {'x'.join(f'{v:g}' for v in frame.voxel_size_nm)} nm  "
-              f"origin {tuple(frame.origin_nm)}", file=sys.stderr)
-        layers.append(ServedLayer(array, kind=kind, name=name, frame=frame,
-                                  channel_axis=channel_axis, shader=args.shader))
+        # `ServedLayer.from_source` owns the reading, so the notebook path and this one
+        # cannot drift — this used to be a second implementation of it here.
+        try:
+            layer = ServedLayer.from_source(src, kind, level=args.level, crop=crop,
+                                            voxel_size=voxel_size, shader=args.shader)
+        except ServeProblem as e:
+            raise SystemExit(str(e)) from None
+        except FileNotFoundError as e:
+            raise SystemExit(str(e)) from None
+        except KeyError as e:
+            # An HDF5 container listing its datasets; the message is the useful part.
+            raise SystemExit(str(e.args[0] if e.args else e)) from None
+        print(f"  {kind:13} {src}  {layer.array.shape} {layer.array.dtype}  "
+              f"voxel {'x'.join(f'{v:g}' for v in layer.frame.voxel_size_nm)} nm  "
+              f"origin {tuple(layer.frame.origin_nm)}  as {layer.name!r}",
+              file=sys.stderr)
+        layers.append(layer)
 
     into = None
     if args.into:
