@@ -141,7 +141,7 @@ class ServedLayer:
                    channel_axis=channel_axis, **kwargs)
 
     @classmethod
-    def _read(cls, src: Any, kind: str | None, name: str | None, *, path: str,
+    def _read(cls, src: Any, kind: str | None, name: str | None,
               **read_kwargs) -> "ServedLayer":
         """Read through ``neu_vol.read_piece`` and wrap it. Shared by the three readers.
 
@@ -157,8 +157,9 @@ class ServedLayer:
             # ServeProblem. Translated rather than left to leak, so `except ServeProblem`
             # around a constructor means what it says.
             raise ServeProblem(str(e)) from None
-        return cls.from_piece(
-            piece, name=name or _default_name(path, read_kwargs.get("dataset")))
+        # The name comes off the piece: `read_piece` derives it from the source, so this
+        # package no longer keeps a second rule for it.
+        return cls.from_piece(piece, name=name)
 
     @classmethod
     def from_hdf5(cls, path: str, dataset: str | None = None, kind: str | None = None, *,
@@ -182,8 +183,8 @@ class ServedLayer:
         not recognise still opens.
 
         """
-        return cls._read(str(path), kind, name, path=str(path), dataset=dataset,
-                         src_format="hdf5", crop=crop, voxel_size=voxel_size, **kwargs)
+        return cls._read(str(path), kind, name, dataset=dataset, src_format="hdf5",
+                         crop=crop, voxel_size=voxel_size, **kwargs)
 
     @classmethod
     def from_volume(cls, volume: str, kind: str | None = None, *, level: int = 0,
@@ -203,7 +204,7 @@ class ServedLayer:
 
         A whole volume is usually far too large to hold in memory — pass ``crop``.
         """
-        return cls._read(volume, kind, name, path=volume, level=level, crop=crop,
+        return cls._read(volume, kind, name, level=level, crop=crop,
                          voxel_size=voxel_size, **kwargs)
 
     @classmethod
@@ -214,9 +215,10 @@ class ServedLayer:
             piece = neu_vol.read_piece("gt.h5:/vol_03700", "segmentation")
             layer = ServedLayer.from_piece(piece)
 
-        ``kind`` defaults to the piece's own, so a piece read from a source that records one
-        (a precomputed volume's ``info["type"]``) needs nothing said. Where neither says it
-        is **required** rather than guessed: a uint8 label array is indistinguishable from
+        ``kind`` and ``name`` both default to the piece's own, so a piece from
+        :func:`neu_vol.read_piece` arrives fully described — named after its source and
+        knowing what its voxels mean. ``kind`` where neither says is **required** rather
+        than guessed: a uint8 label array is indistinguishable from
         an image by dtype, and neuroglancer's own guess reads it as one — averaging label
         ids on downsample and losing the colour hashing and the selection UI.
 
@@ -250,7 +252,7 @@ class ServedLayer:
         container. Only a **leading slash** makes it a dataset, so a scheme's own colon
         (``s3://…``) is left alone.
         """
-        return cls._read(src, kind, name, path=src, level=level, crop=crop,
+        return cls._read(src, kind, name, level=level, crop=crop,
                          voxel_size=voxel_size, **kwargs)
 
     # ------------------------------------------------------------ where it is
@@ -302,20 +304,6 @@ class ServedLayer:
                 f"{rank}-D array {tuple(self.array.shape)}, which has "
                 f"{'a' if derived else 'no'} leading channel axis. Leave it out — the rank "
                 f"decides it")
-
-
-def _default_name(path: str, dataset: str | None) -> str:
-    """A layer name from a source: the dataset if there is one, else the file stem."""
-    import os
-
-    if dataset:
-        return dataset.strip("/").replace("/", "_") or "layer"
-    stem = os.path.basename(str(path).rstrip("/"))
-    for suffix in (".h5", ".hdf5", ".hdf", ".he5", ".zarr", ".precomputed", ".n5"):
-        if stem.lower().endswith(suffix):
-            stem = stem[: -len(suffix)]
-            break
-    return stem or "layer"
 
 
 @dataclass

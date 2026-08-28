@@ -416,10 +416,10 @@ def test_from_hdf5_takes_the_frame_the_file_records(tmp_path):
     assert layer.array.shape == (6, 8, 8)
     assert tuple(layer.frame.voxel_size_nm) == (40.0, 8.0, 8.0)
     assert tuple(layer.frame.origin_nm) == (80.0, 24.0, 32.0)
-    # With no dataset named, the FILE stem names the layer: `read_piece` resolves the sole
-    # dataset internally, and `piece` is more use than the generic `/data` it resolved to.
-    # Naming one explicitly still wins — see the container test below.
-    assert layer.name == "piece"
+    # `stem/dataset`, from `neu_vol.piece_name` via the Piece — both halves, because either
+    # alone collides: `/data` is what to-hdf5 writes by default, and one file's nine crops
+    # share a stem. Serving two of either is ordinary and neuroglancer keys a layer by name.
+    assert layer.name == "piece/data"
 
 
 def test_from_hdf5_needs_a_kind_and_says_why(tmp_path):
@@ -467,7 +467,7 @@ def test_a_multi_dataset_container_must_be_told_which_array(tmp_path):
 
     with pytest.raises(KeyError, match="2 volumetric datasets"):
         ServedLayer.from_hdf5(path, kind="segmentation")
-    assert ServedLayer.from_hdf5(path, "/b", "segmentation").name == "b"
+    assert ServedLayer.from_hdf5(path, "/b", "segmentation").name == "bag/b"
 
 
 def test_a_level_on_a_single_array_is_an_error(tmp_path):
@@ -479,7 +479,7 @@ def test_a_level_on_a_single_array_is_an_error(tmp_path):
 def test_from_source_splits_a_dataset_only_on_a_LEADING_slash(tmp_path):
     """`s3://…` carries a colon of its own, so only `:/name` selects an array."""
     path = _piece(tmp_path, voxel_size=np.asarray([8.0, 8.0, 8.0]), axes="zyx")
-    assert ServedLayer.from_source(f"{path}:/data", "image").name == "data"
+    assert ServedLayer.from_source(f"{path}:/data", "image").name == "piece/data"
     # no leading slash: the whole string is the path, and there is no such file
     with pytest.raises((ServeProblem, FileNotFoundError)):
         ServedLayer.from_source(f"{path}:data", "image")
