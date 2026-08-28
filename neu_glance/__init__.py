@@ -14,6 +14,10 @@ Three things it makes, all from the same pieces:
 - a **layer** of local annotations, from coordinates or from occupancy boxes
   (:mod:`neu_glance.layers`)
 
+and one thing it *runs*: a viewer over arrays held in this process
+(:mod:`neu_glance.serving`), for looking at something that is not published — a
+ground-truth crop, a box out of a volume, a probability map straight out of a model.
+
 :mod:`neu_glance.layers` and :mod:`neu_glance.state` are pure — plain data in, plain data out, no
 store access — and :mod:`neu_glance.sources` is the only module that reads anything. Keeping that
 line is what will let a locally served volume become a layer without touching state assembly.
@@ -52,7 +56,15 @@ _EXPORTS = {
     "rescale": "layers",
     "render": "layers",
     "SHADERS": "shaders",
+    "IMAGE_SHADERS": "shaders",
     "pick_shader": "shaders",
+    "image_shader": "shaders",
+    # Hosting arrays in this process. The module name differs from the export so the two
+    # cannot collide: `neu_glance.serve` is the function, `neu_glance.serving` the module.
+    "serve": "serving",
+    "ServedLayer": "serving",
+    "Server": "serving",
+    "ServeProblem": "serving",
 }
 
 __all__ = ["__version__", *sorted(_EXPORTS)]

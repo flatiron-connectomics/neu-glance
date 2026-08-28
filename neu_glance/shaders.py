@@ -135,3 +135,117 @@ def pick_shader(info: Mapping[str, Any], name: str | None,
             f"shader {name!r} is neither a built-in name ("
             + ", ".join(SHADERS) + ", none) nor a readable file")
     return raw.decode(), f"from {name}"
+
+
+# --------------------------------------------------------------------------- #
+# Image shaders — a separate registry, and separate for a reason
+#
+# An annotation shader reads `prop_<name>()`, so `pick_shader` has to check those names
+# against what the source declares or the layer silently draws nothing. An IMAGE shader
+# reads `getDataValue(channel)`, which every image source has by construction: there is
+# nothing to validate, and no way to name a channel that does not exist except by asking
+# for one past the end — which is a shape error, catchable here.
+#
+# So these are chosen by DATA KIND and channel count, not by property matching, and
+# `pick_shader`'s refusal logic deliberately does not apply to them.
+# --------------------------------------------------------------------------- #
+
+#: Window/level over one channel. The default for `--kind image`: EM data arrives with its
+#: useful range in some arbitrary part of the dtype, and neuroglancer's own default maps
+#: the whole range, which shows grey mud.
+GRAYSCALE_SHADER = """\
+#uicontrol invlerp normalized
+#uicontrol float gamma slider(min=0.05, max=3.0, default=1.0, step=0.05)
+
+void main() {
+  float v = pow(normalized(), gamma);
+  emitGrayscale(v);
+}
+"""
+
+#: One channel through a two-colour gradient, with a floor. For a probability map, where
+#: the interesting question is "where is this above t", not "what is the whole range".
+#:
+#: The threshold is written **discard-if-below**, never keep-if-at-or-above, for the reason
+#: `SYNAPSE_SHADER` is: NaN fails every comparison, so `discard if v < t` leaves an
+#: unscored voxel visible at every threshold while the inverted form would hide it at all
+#: of them. A probability map from a model can carry NaN wherever it declined to predict.
+COLORMAP_SHADER = """\
+#uicontrol invlerp normalized
+#uicontrol vec3 low_color color(default="#000060")
+#uicontrol vec3 high_color color(default="#ffe000")
+#uicontrol float threshold slider(min=0.0, max=1.0, default=0.0, step=0.01)
+#uicontrol float opacity slider(min=0.0, max=1.0, default=1.0, step=0.01)
+
+void main() {
+  float v = normalized();
+  // discard-if-below, so a NaN voxel stays visible at every threshold
+  if (v < threshold) discard;
+  emitRGBA(vec4(mix(low_color, high_color, v), opacity));
+}
+"""
+
+#: Three channels to three colours with independent gains. For a 3-channel probability map
+#: — affinities, or a boundary/interior/background triple — where the useful view is all
+#: three at once rather than one at a time.
+RGB_SHADER = """\
+#uicontrol vec3 color0 color(default="#ff2000")
+#uicontrol vec3 color1 color(default="#00c000")
+#uicontrol vec3 color2 color(default="#2060ff")
+#uicontrol float gain0 slider(min=0.0, max=4.0, default=1.0, step=0.05)
+#uicontrol float gain1 slider(min=0.0, max=4.0, default=1.0, step=0.05)
+#uicontrol float gain2 slider(min=0.0, max=4.0, default=1.0, step=0.05)
+#uicontrol float opacity slider(min=0.0, max=1.0, default=1.0, step=0.01)
+
+void main() {
+  vec3 rgb = color0 * (toNormalized(getDataValue(0)) * gain0)
+           + color1 * (toNormalized(getDataValue(1)) * gain1)
+           + color2 * (toNormalized(getDataValue(2)) * gain2);
+  emitRGBA(vec4(clamp(rgb, 0.0, 1.0), opacity));
+}
+"""
+
+#: Built-in image shaders by name. Unlike :data:`SHADERS` these declare no properties —
+#: see the section comment — but they do declare how many channels they read, which is the
+#: one thing that can be wrong about them.
+IMAGE_SHADERS: dict[str, dict[str, Any]] = {
+    "grayscale": {"channels": 1, "doc": "window/level with gamma, single channel",
+                  "source": GRAYSCALE_SHADER},
+    "colormap": {"channels": 1, "doc": "one channel through a two-colour gradient, with "
+                                       "a discard-if-below threshold",
+                 "source": COLORMAP_SHADER},
+    "rgb": {"channels": 3, "doc": "three channels to three colours with independent gains",
+            "source": RGB_SHADER},
+}
+
+#: Which shader a served layer gets when the caller names none.
+_DEFAULT_IMAGE_SHADER = {"image": "grayscale", "probability": "colormap"}
+
+
+def image_shader(name: str | None, *, kind: str = "image", channels: int = 1) -> str | None:
+    """GLSL for an image-like layer, or ``None`` for neuroglancer's own default.
+
+    ``name`` may be a built-in name, ``"none"``, or ``None`` to take the default for
+    ``kind`` — grayscale for an image, a gradient for a probability map. A 3-channel array
+    defaults to ``rgb`` whatever the kind, since showing one channel of three and calling
+    it the picture is the more surprising choice.
+
+    A shader/channel-count mismatch **raises**: `rgb` on a single-channel volume reads
+    `getDataValue(1)` past the end, and a one-channel shader on a 3-channel volume shows a
+    third of the data with nothing to say so.
+    """
+    if name == "none":
+        return None
+    if name is None:
+        name = "rgb" if channels == 3 else _DEFAULT_IMAGE_SHADER.get(kind, "grayscale")
+    entry = IMAGE_SHADERS.get(name)
+    if entry is None:
+        raise ShaderProblem(
+            f"unknown image shader {name!r}; built-ins are "
+            + ", ".join(IMAGE_SHADERS) + ", none")
+    if entry["channels"] != channels:
+        raise ShaderProblem(
+            f"shader {name!r} reads {entry['channels']} channel(s) and this volume has "
+            f"{channels}. Asking for a channel that is not there fails to compile, and "
+            f"reading one of three shows a third of the data with nothing to say so.")
+    return entry["source"]

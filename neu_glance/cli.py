@@ -4,18 +4,23 @@ Argparse, matching its siblings (`neu-vol`, `neu-morpho`, `neu-mark`) rather tha
 second CLI framework into the family. Heavy imports stay inside the subcommand that needs them
 so ``--help`` is fast.
 
-Five subcommands, and the division between them is *what they produce*:
+Six subcommands, and the division between them is *what they produce*:
 
 - ``gen`` composes a **state** from volumes, annotation sources and layer files
 - ``annotate`` makes a **layer** from coordinates or a CSV
 - ``bboxes`` makes a **layer** from a volume's occupancy
+- ``serve`` hosts arrays here and **runs a viewer** on them
 - ``parse`` reads a URL back into its state JSON
-- ``shaders`` lists or prints the built-in annotation shaders
+- ``shaders`` lists or prints the built-in shaders
 
 The three producers share one output stage: ``--format {layer,state,url}`` decides the
 serialization and ``--into`` merges into an existing state instead of building a new one. That
 is why they are separate subcommands rather than one — the *inputs* differ completely, while
 the output is uniform.
+
+``serve`` is the odd one and takes none of that stage: what it produces is a *running
+server*, and a served array's source is a ``python://volume/<token>`` URL scoped to the
+process, so there is no link to emit and no state worth saving.
 """
 
 from __future__ import annotations
@@ -44,6 +49,10 @@ _ANN_CSV_COLUMNS = {
 _LAYOUTS = ("4panel", "xy", "yz", "xz", "xy-3d", "yz-3d", "xz-3d", "3d")
 _DEFAULT_VIEWER = "https://neuroglancer-demo.appspot.com/"
 _SHADER_NAMES = ("synapse",)
+#: Image-shader names, duplicated from `shaders.IMAGE_SHADERS` for the same reason
+#: `_ANN_CSV_COLUMNS` is: the parser needs them at build time, and importing the module
+#: then would pull neu-vol into every `neu-glance --help`. A test asserts they agree.
+_IMAGE_SHADER_NAMES = ("grayscale", "colormap", "rgb", "none")
 
 
 # --------------------------------------------------------------------------- #
@@ -57,6 +66,15 @@ def _ftriple(value, name):
     if len(parts) != 3:
         raise SystemExit(f"--{name} needs 3 comma-separated values, got {value!r}")
     return parts
+
+
+def _sextuple(value, name):
+    """'z0,y0,x0,z1,y1,x1' -> ``(lo, hi)`` in zyx voxels."""
+    parts = tuple(int(v) for v in str(value).replace(" ", "").split(","))
+    if len(parts) != 6:
+        raise SystemExit(f"--{name} needs 6 comma-separated whole numbers "
+                         f"(z0,y0,x0,z1,y1,x1), got {value!r}")
+    return parts[:3], parts[3:]
 
 
 def _write_text(path: str, text: str) -> None:
@@ -457,6 +475,68 @@ def build_parser() -> argparse.ArgumentParser:
     q.set_defaults(func=cmd_bboxes)
 
     # --- parse --------------------------------------------------------------
+    # --- serve --------------------------------------------------------------
+    # No `_add_output_flags`: what this produces is a running server, not a
+    # serialization. `parse` and `shaders` are the precedent for a subcommand that skips
+    # the shared output stage entirely.
+    q = sub.add_parser(
+        "serve", help="host arrays locally and open a viewer on them",
+        description="Serve one or more arrays from THIS process and print the viewer "
+                    "link.\n\n"
+                    "For looking at something that is not published: a ground-truth "
+                    "crop, a box out of a volume, a probability map. Each --image / --seg "
+                    "/ --prob is a path (an HDF5 file, a volume, a slice stack), "
+                    "optionally with a level and a box.\n\n"
+                    "  neu-glance serve --seg piece.h5\n"
+                    "  neu-glance serve --image vol --seg gt --crop-bbox 0,0,0,64,512,512\n"
+                    "  neu-glance serve --image piece.h5:/raw --prob piece.h5:/affinity\n\n"
+                    "Runs until Ctrl-C. The link is only valid while it runs: a served "
+                    "array is addressed `python://volume/<token>`, scoped to this "
+                    "process, so it cannot be shared or saved. Use `gen` for that, "
+                    "against a published volume.\n\n"
+                    "Needs the optional extra: pip install 'neu-glance[serve]'",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    q.add_argument("--image", action="append", metavar="SRC",
+                   help="an image source (repeatable). PATH, or PATH:DATASET for an HDF5 "
+                        "container holding more than one array")
+    q.add_argument("--seg", action="append", metavar="SRC",
+                   help="a segmentation source (repeatable). Served as labels whatever the "
+                        "dtype — neuroglancer would read a uint8 label array as an image, "
+                        "which loses the colour hashing and the selection UI")
+    q.add_argument("--prob", action="append", metavar="SRC",
+                   help="a probability / continuous-scalar source (repeatable). A leading "
+                        "3-channel axis is shown as three colours; one channel gets a "
+                        "gradient with a threshold")
+    q.add_argument("--level", type=int, default=0, metavar="N",
+                   help="which level to read from a multiscale --image/--seg/--prob "
+                        "(default: 0). Applies to every source")
+    q.add_argument("--crop-bbox", default=None, metavar="Z0,Y0,X0,Z1,Y1,X1",
+                   help="serve only this box, in --level voxels. Whole volumes are usually "
+                        "far too large to hold in memory, so this is required for anything "
+                        "but a piece or a small volume")
+    q.add_argument("--voxel-size", default=None, metavar="Z,Y,X",
+                   help="voxel size in nm, overriding what the sources record. Needed for "
+                        "a source that records none (a slice stack, a plain HDF5 file)")
+    q.add_argument("--shader", default=None, metavar="NAME_OR_PATH",
+                   help="GLSL for the image-like layers: a built-in name ("
+                        + ", ".join(_IMAGE_SHADER_NAMES) + "), or 'none' for "
+                        "neuroglancer's own default. Default picks by kind and channel "
+                        "count")
+    q.add_argument("--bind", default="127.0.0.1", metavar="ADDRESS",
+                   help="the address to serve on (default: 127.0.0.1, reachable only from "
+                        "this machine). Use 0.0.0.0 when the browser is elsewhere; the "
+                        "printed link then names this host")
+    q.add_argument("--port", type=int, default=0, metavar="N",
+                   help="port to serve on (default: 0, meaning any free one)")
+    q.add_argument("--into", default=None, metavar="PATH_OR_URL",
+                   help="start from an existing state, given as a URL or a JSON file, and "
+                        "add the served layers to it — keeping its view")
+    q.add_argument("--no-regions", dest="regions", action="store_false",
+                   help="omit the empty annotation layer. By default one is added to draw "
+                        "boxes in, which is what makes a region picked in the viewer "
+                        "reusable here")
+    q.set_defaults(func=cmd_serve)
+
     q = sub.add_parser(
         "parse", help="a neuroglancer URL back into its state JSON",
         description="Decode the state out of a link, for reading or editing it.\n\n"
@@ -784,22 +864,173 @@ def cmd_parse(args) -> int:
     return 0
 
 
+def _read_array(src: str, *, level: int, crop, voxel_size):
+    """One ``--image``/``--seg``/``--prob`` source as ``(array, frame, channel_axis)``.
+
+    ``src`` is ``PATH`` or ``PATH:DATASET``, the second form naming an array inside an
+    HDF5 container. Reading goes through neu-vol — its backends already handle every
+    format this suite can read, and its `describe` already resolves a container's sole
+    dataset or lists the alternatives.
+
+    The **frame travels with the array**, and where a crop is taken the frame's origin
+    shifts by the crop start. That is what keeps a served box on top of the volume it came
+    from rather than at nm zero (CLAUDE.md invariant 1); dropping it is silent.
+    """
+    from neu_lib import Frame
+    from neu_vol import describe, open_backend
+    from neu_vol.source_metadata import level_spec, read_level_voxel_sizes
+
+    path, _, dataset = src.partition(":")
+    # A Windows-style or scheme-ish colon is not a dataset. Only a leading slash is, which
+    # is how every dataset path in this suite is written.
+    if dataset and not dataset.startswith("/"):
+        path, dataset = src, ""
+    try:
+        described = describe(path, dataset=dataset or None)
+    except FileNotFoundError as e:
+        raise SystemExit(str(e)) from None
+    except KeyError as e:
+        # An HDF5 container listing its datasets; the message is the useful part.
+        raise SystemExit(str(e.args[0] if e.args else e)) from None
+    if described["shape"] is None:
+        from neu_vol.source_metadata import require_one_array
+
+        require_one_array(described, path, "neu-glance serve")
+
+    fmt = described["format"]
+    spec = (described["spec"] if level == 0 or fmt in ("hdf5", "image_stack")
+            else level_spec(path, fmt, level, dataset=dataset or None))
+    if level and fmt in ("hdf5", "image_stack"):
+        raise SystemExit(f"--level {level} needs a multiscale volume; {path} is {fmt}, "
+                         f"which is a single array")
+    backend = open_backend(spec)
+    shape = tuple(int(s) for s in backend.shape)
+
+    meta = described["meta"] or {}
+    per_level = read_level_voxel_sizes(described["spec"]) or []
+    voxel = (voxel_size or (tuple(per_level[level]) if level < len(per_level) else None)
+             or meta.get("voxel_size"))
+    if voxel is None:
+        raise SystemExit(
+            f"{path} records no voxel size, so nothing here knows its physical scale; "
+            f"pass --voxel-size z,y,x")
+
+    channel_axis = len(shape) == 4
+    spatial = shape[1:] if channel_axis else shape
+    lo = (0,) * 3
+    if crop:
+        lo, hi = crop
+        for a, (start, stop, extent) in enumerate(zip(lo, hi, spatial)):
+            if not 0 <= start < stop <= extent:
+                raise SystemExit(
+                    f"--crop-bbox {lo}:{hi} does not fit {path}'s level-{level} extent "
+                    f"{spatial} on axis {a}")
+        region = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
+    else:
+        region = tuple(slice(0, int(s)) for s in spatial)
+    if channel_axis:
+        region = (slice(0, shape[0]),) + region
+
+    array = backend.read_region(region)
+    origin = tuple(float(o) * v for o, v in zip(lo, voxel))
+    recorded = meta.get("offset")
+    if recorded and not crop:
+        origin = tuple(float(o) for o in recorded)
+    elif recorded and crop:
+        # A crop out of a piece that already knows where it belongs lands at the SUM, the
+        # same rule `neu-vol to-hdf5 --crop-bbox` follows.
+        origin = tuple(float(o) + s for o, s in zip(recorded, origin))
+    return array, Frame(voxel_size_nm=tuple(voxel), origin_nm=origin), channel_axis
+
+
+def cmd_serve(args) -> int:
+    """Host the given arrays and run a viewer on them until interrupted."""
+    from .serving import ServedLayer, ServeProblem, _neuroglancer, serve
+
+    # Before anything is READ. The extra being absent is the likeliest failure here, and
+    # discovering it after pulling a few GB of crop into memory is the wrong order.
+    try:
+        _neuroglancer()
+    except ServeProblem as e:
+        raise SystemExit(str(e)) from None
+
+    crop = _sextuple(args.crop_bbox, "crop-bbox") if args.crop_bbox else None
+    voxel_size = _ftriple(args.voxel_size, "voxel-size")
+    requested = [(src, kind)
+                 for kind, flag in (("image", args.image), ("segmentation", args.seg),
+                                    ("probability", args.prob))
+                 for src in (flag or ())]
+    if not requested:
+        raise SystemExit("nothing to serve: pass at least one --image, --seg or --prob")
+
+    layers = []
+    for src, kind in requested:
+        array, frame, channel_axis = _read_array(
+            src, level=args.level, crop=crop, voxel_size=voxel_size)
+        name = src.rsplit("/", 1)[-1].replace(":", "").replace(".h5", "") or kind
+        print(f"  {kind:13} {src}  {array.shape} {array.dtype}  "
+              f"voxel {'x'.join(f'{v:g}' for v in frame.voxel_size_nm)} nm  "
+              f"origin {tuple(frame.origin_nm)}", file=sys.stderr)
+        layers.append(ServedLayer(array, kind=kind, name=name, frame=frame,
+                                  channel_axis=channel_axis, shader=args.shader))
+
+    into = None
+    if args.into:
+        from .state import load_state
+
+        into = load_state(args.into)
+
+    try:
+        server = serve(layers, bind=args.bind, port=args.port, into=into,
+                       regions="regions" if args.regions else None)
+    except ServeProblem as e:
+        raise SystemExit(str(e)) from None
+
+    print(server.url)
+    print("\nCtrl-C to stop. The link dies with this process — a served array is "
+          "addressed\npython://volume/<token>, so it cannot be shared or saved.",
+          file=sys.stderr)
+    if args.bind == "127.0.0.1":
+        print("Serving on 127.0.0.1, reachable only from this machine. Use --bind 0.0.0.0 "
+              "if\nthe browser is elsewhere.", file=sys.stderr)
+    try:
+        import threading
+
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        print("\nstopping", file=sys.stderr)
+        server.stop()
+    return 0
+
+
 def cmd_shaders(args) -> int:
-    """List the built-in annotation shaders, or print one."""
-    from .shaders import SHADERS
+    """List the built-in shaders, or print one.
+
+    Two families, listed apart because what can be wrong about them differs: an
+    ANNOTATION shader names `prop_`s the source has to declare, and an IMAGE shader names
+    a channel count the volume has to have.
+    """
+    from .shaders import IMAGE_SHADERS, SHADERS
 
     if args.name is None:
+        print("annotation shaders  (for `gen --annotation-shader`)")
         for name, entry in SHADERS.items():
-            print(f"{name}\t{entry['doc']}")
-            print(f"  reads: {', '.join(entry['properties'])}")
+            print(f"  {name}\t{entry['doc']}")
+            print(f"    reads: {', '.join(entry['properties'])}")
+        print("\nimage shaders  (for `serve --shader`)")
+        for name, entry in IMAGE_SHADERS.items():
+            print(f"  {name}\t{entry['doc']}")
+            print(f"    channels: {entry['channels']}")
         print("\nA shader naming a property the source does not declare fails to compile "
-              "and the layer draws NOTHING, so `gen` checks before applying one.")
+              "and the layer draws NOTHING, so `gen` checks before applying one; `serve` "
+              "checks the channel count for the same reason.")
         return 0
-    if args.name not in SHADERS:
-        raise SystemExit(f"no built-in shader {args.name!r}; known: "
-                         + ", ".join(SHADERS))
-    print(SHADERS[args.name]["source"], end="")
-    return 0
+    for registry in (SHADERS, IMAGE_SHADERS):
+        if args.name in registry:
+            print(registry[args.name]["source"], end="")
+            return 0
+    raise SystemExit(f"no built-in shader {args.name!r}; known: "
+                     + ", ".join([*SHADERS, *IMAGE_SHADERS]))
 
 
 def main(argv=None) -> int:

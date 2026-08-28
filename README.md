@@ -12,15 +12,16 @@ neu-glance gen --image s3://bucket/em --seg s3://bucket/seg_v1 \
     --annotations s3://bucket/seg_v1/synapses_v1 --annotation-split --segments 12345
 ```
 
-## The five subcommands
+## The six subcommands
 
 | | produces |
 | --- | --- |
 | `neu-glance gen` | a **state** from volumes, annotation sources and layer files |
 | `neu-glance annotate` | a **layer** from coordinates or a CSV |
 | `neu-glance bboxes` | a **layer** from a volume's occupancy |
+| `neu-glance serve` | a **running viewer** over arrays held in this process |
 | `neu-glance parse` | a URL back into its state JSON |
-| `neu-glance shaders` | lists or prints the built-in annotation shaders |
+| `neu-glance shaders` | lists or prints the built-in shaders |
 
 The three producers share one output stage. `--format {layer,state,url}` chooses the
 serialization — a bare layer to paste into a state's `layers` array, a whole state for
@@ -31,6 +32,48 @@ instead of stdout.
 state's own `dimensions`, position and zoom are kept, so adding a layer does not move your
 view, and a layer whose name is already taken is renamed and reported rather than silently
 shadowing the one already there.
+
+## Looking at something that is not published
+
+`serve` hosts arrays from this process and prints a viewer link — a ground-truth crop, a
+box out of a volume, a probability map straight out of a model. It replaces serving HDF5
+chunks through chunkflow to eyeball them.
+
+```bash
+neu-glance serve --seg piece.h5                          # a crop, labels and all
+neu-glance serve --image vol --seg gt --crop-bbox 0,0,0,64,512,512
+neu-glance serve --image piece.h5:/raw --prob piece.h5:/affinity
+```
+
+Needs the optional extra, `pip install 'neu-glance[serve]'`, because building a state needs
+none of it and CI has no business downloading a viewer bundle.
+
+From a notebook it is the same thing with a handle on it, and the handle is the point — the
+server runs in **your kernel**, so the browser's state is readable here:
+
+```python
+from neu_glance import serve, ServedLayer
+srv = serve([ServedLayer(prob, kind="probability", frame=frame)])
+srv                                  # renders the link
+srv.boxes()                          # boxes you drew, as (lo, hi) in zyx voxels
+srv.selected_segments()              # label ids you clicked
+srv.on_click(lambda c: print(c.voxel, c.values))
+```
+
+`srv.boxes()` is what closes the loop: pick a region in the viewer, hand it straight to
+`--crop-bbox`, `extract_roi` or `neu-vol write`.
+
+Three things about it that are not obvious:
+
+- **A served link is not shareable.** Each array is addressed
+  `python://volume/<viewer-token>`, scoped to the process and dead when it exits. So
+  `serve` has no `--format url`; use `gen` against a volume that is actually published.
+- **`--seg` is served as labels whatever the dtype.** neuroglancer guesses segmentation
+  only for uint16/32/64, so a uint8 label array would be read as an image — averaging
+  label ids on downsample and losing the colour hashing and the selection UI, silently.
+- **The frame travels with the array.** A crop keeps its origin, so it lands on top of the
+  volume it came from rather than at nm zero. A source that records one (`neu-vol to-hdf5`
+  writes it) needs no `--voxel-size`.
 
 ## Things that fail silently, and where they are handled
 
@@ -57,7 +100,8 @@ the four worth knowing up front:
 neu_glance/
 ├── layers.py    local annotation layers — from coordinates, or from occupancy boxes
 ├── sources.py   layers for something on a store: a volume, an annotation source
-├── shaders.py   GLSL, and the rule for choosing one
+├── serving.py   host arrays HERE and run a viewer on them; the only neuroglancer import
+├── shaders.py   GLSL, and the rule for choosing one — annotation and image families
 ├── state.py     assemble a state, encode a URL, read one back, merge into one
 └── cli.py       neu-glance
 ```
