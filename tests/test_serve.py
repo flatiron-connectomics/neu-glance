@@ -581,15 +581,15 @@ def test_a_bare_zarr_array_still_works(tmp_path):
 def test_a_crop_takes_either_shape():
     """`((lo), (hi))` and the flat `(z0,y0,x0,z1,y1,x1)` the CLI takes. Writing one where
     the other is expected is the obvious slip, and the two are unambiguous by length."""
-    from neu_glance.serving import _crop_box
+    from neu_glance.serving import _crop_request
 
-    assert _crop_box(((1, 2, 3), (4, 5, 6))) == ((1, 2, 3), (4, 5, 6))
-    assert _crop_box((1, 2, 3, 4, 5, 6)) == ((1, 2, 3), (4, 5, 6))
-    assert _crop_box(None) is None
-    with pytest.raises(ServeProblem, match="whole VOXELS"):
-        _crop_box((1, 2, 3, 4))
+    assert _crop_request(((1, 2, 3), (4, 5, 6))) == (((1, 2, 3), (4, 5, 6)), None)
+    assert _crop_request((1, 2, 3, 4, 5, 6)) == (((1, 2, 3), (4, 5, 6)), None)
+    assert _crop_request(None) == (None, None)
+    with pytest.raises(ServeProblem, match="VOXELS"):
+        _crop_request((1, 2, 3, 4))
     with pytest.raises(ServeProblem, match="3 values each"):
-        _crop_box(((1, 2), (3, 4)))
+        _crop_request(((1, 2), (3, 4)))
 
 
 def test_a_crop_given_in_NANOMETRES_says_so(tmp_path):
@@ -603,22 +603,95 @@ def test_a_crop_given_in_NANOMETRES_says_so(tmp_path):
         ServedLayer.from_volume(vol, crop=((0, 0, 0), (6400, 2560, 2560)))
 
 
-def test_from_backend_agrees_with_from_hdf5(tmp_path):
-    """Both read the frame through the same `to_spec()` metadata, so the axis-order rule
-    lives in one place rather than once per entry point."""
-    from neu_vol import open_hdf5
-
+def test_a_layer_reports_where_it_is_through_its_Piece(tmp_path):
+    """The geometry questions live on `neu_lib.Piece`, not here — a layer is a piece plus
+    how to draw it, so it delegates rather than reimplementing bbox arithmetic."""
     path = _piece(tmp_path, voxel_size=np.asarray([40.0, 8.0, 8.0]),
                   voxel_offset=np.asarray([2, 3, 4], "int64"), axes="zyx")
-    be = open_hdf5(path)
-    direct = ServedLayer.from_hdf5(path, kind="segmentation")
-    from_be = ServedLayer.from_backend(be, "segmentation")
-    dispatched = ServedLayer.from_hdf5(be, "segmentation")   # the obvious thing to try
-    assert direct.frame == from_be.frame == dispatched.frame
-    np.testing.assert_array_equal(direct.array, from_be.array)
-    assert from_be.name == dispatched.name == "data"
+    layer = ServedLayer.from_hdf5(path, kind="segmentation")
+    assert layer.bbox.lo == (2, 3, 4)
+    assert layer.bbox.hi == (2 + 6, 3 + 8, 4 + 8)
+    assert layer.bounds_nm[0] == (80.0, 24.0, 32.0)
+    assert layer.piece.frame == layer.frame
 
 
-def test_from_backend_refuses_something_that_is_not_one():
-    with pytest.raises(ServeProblem, match="expected an open backend"):
-        ServedLayer.from_backend(np.zeros((4, 4, 4)), "image")
+def test_a_layer_with_no_frame_says_it_has_no_position():
+    layer = ServedLayer.from_array(_labels(), "image")
+    with pytest.raises(ServeProblem, match="no frame"):
+        layer.bbox
+
+
+def test_from_piece_is_the_allowed_direction(tmp_path):
+    """`Piece` lives in neu-lib, the bottom tier, so a `Piece.as_layer` would mean the
+    vocabulary package naming a viewer type three tiers above it. neu-glance reading a
+    neu-lib type is the direction the layering permits."""
+    from neu_lib import Frame, Piece
+
+    piece = Piece(array=_labels((4, 8, 8), "uint64"),
+                  frame=Frame(voxel_size_nm=(40, 8, 8), origin_nm=(80, 24, 32)))
+    layer = ServedLayer.from_piece(piece, "segmentation", name="gt")
+    assert layer.kind == "segmentation" and layer.name == "gt"
+    assert layer.frame == piece.frame
+    assert layer.bbox == piece.bbox
+    assert not hasattr(ServedLayer, "from_backend"), \
+        "superseded by Piece: nobody should have to hold a backend to serve a crop"
+
+
+def test_crop_takes_the_same_PHYSICAL_box_as_another_layer(tmp_path):
+    """The workflow the whole thing is for: show the image under a ground-truth crop. The
+    two frames have different voxel sizes and different origins, so no voxel box transfers
+    between them — nanometres are the only shared space."""
+    vol = _ome_volume(tmp_path)                       # 40x8x8 nm at level 0
+    gt = ServedLayer.from_volume(vol, "segmentation", crop=((4, 8, 8), (12, 24, 24)))
+    assert gt.bbox.lo == (4, 8, 8)
+
+    same = ServedLayer.from_volume(vol, "image", crop=gt)
+    assert same.bounds_nm == gt.bounds_nm, "the same physical box"
+    assert same.array.shape == gt.array.shape
+
+    # ...and coarser, where the voxel box differs but the physical box does not
+    coarse = ServedLayer.from_volume(vol, "image", level=1, crop=gt)
+    assert coarse.bbox.lo != gt.bbox.lo
+    assert coarse.bounds_nm[0] == gt.bounds_nm[0]
+    assert coarse.frame.voxel_size_nm == (40.0, 16.0, 16.0)
+
+
+def test_crop_also_takes_a_piece_or_an_explicit_nm_box(tmp_path):
+    from neu_lib import Frame, Piece
+
+    vol = _ome_volume(tmp_path)
+    piece = Piece(array=np.zeros((8, 16, 16)),
+                  frame=Frame(voxel_size_nm=(40, 8, 8), origin_nm=(160, 64, 64)))
+    by_piece = ServedLayer.from_volume(vol, "image", crop=piece)
+    by_nm = ServedLayer.from_volume(vol, "image", crop={"nm": piece.bounds_nm})
+    assert by_piece.bounds_nm == by_nm.bounds_nm
+    assert by_piece.array.shape == (8, 16, 16)
+
+    with pytest.raises(ServeProblem, match="must carry 'nm'"):
+        ServedLayer.from_volume(vol, "image", crop={"voxels": ((0, 0, 0), (1, 1, 1))})
+
+
+def test_a_physical_box_clipped_to_almost_nothing_is_LOUD(tmp_path, caplog):
+    """Reading one dataset's crop out of another's image is the easy mistake: the numbers
+    are plausible, the read succeeds, and back comes a thin slab nobody asked for. So the
+    fraction is reported, and losing most of the box says what it usually means."""
+    from neu_lib import Frame, Piece
+
+    vol = _ome_volume(tmp_path)                       # level 0 is (16, 32, 32)
+    # a box mostly past the volume's z extent
+    far = Piece(array=np.zeros((8, 8, 8)),
+                frame=Frame(voxel_size_nm=(40, 8, 8), origin_nm=(560, 0, 0)))
+    with caplog.at_level("WARNING"):
+        layer = ServedLayer.from_volume(vol, "image", crop=far)
+    assert layer.array.shape[0] == 2, "clipped to what exists"
+    assert "clipped to" in caplog.text and "different dataset" in caplog.text
+
+
+def test_a_physical_box_entirely_outside_raises(tmp_path):
+    from neu_lib import Frame, Piece
+
+    vol = _ome_volume(tmp_path)
+    away = Piece(array=np.zeros((8, 8, 8)),
+                 frame=Frame(voxel_size_nm=(40, 8, 8), origin_nm=(99999, 0, 0)))
+    with pytest.raises(ServeProblem, match="not the same volume"):
+        ServedLayer.from_volume(vol, "image", crop=away)

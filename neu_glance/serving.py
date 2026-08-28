@@ -37,8 +37,9 @@ the browser's own state back, so a region picked in the viewer is usable in the 
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -155,50 +156,11 @@ class ServedLayer:
         The format is forced rather than detected, so a file whose extension detection does
         not recognise still opens.
 
-        An already-open ``HDF5Backend`` is accepted in place of the path and forwarded to
-        :meth:`from_backend` — that is the obvious thing to try, so it works rather than
-        failing on ``str()`` of a backend.
         """
-        if not isinstance(path, (str, bytes)) and not hasattr(path, "__fspath__"):
-            if dataset is not None and kind is None:
-                # from_hdf5(backend, "segmentation") — the second positional is the kind
-                dataset, kind = None, dataset
-            return cls.from_backend(path, kind, crop=crop, name=name,
-                                    voxel_size=voxel_size, **kwargs)
         return cls._from_read(
             _read_source(str(path), dataset, "hdf5", level=0, crop=crop,
                          voxel_size=voxel_size),
             path=str(path), kind=kind, name=name, **kwargs)
-
-    @classmethod
-    def from_backend(cls, backend: Any, kind: str | None = None, *, crop: Any = None,
-                     name: str | None = None,
-                     voxel_size: Sequence[float] | None = None,
-                     **kwargs) -> "ServedLayer":
-        """A backend you already have open — from ``neu_vol.open_hdf5``, say.
-
-            be = neu_vol.open_hdf5("gt.h5", "/z07901")
-            layer = ServedLayer.from_backend(be, "segmentation")
-
-        The frame is read through the backend's own ``to_spec()``, so it comes out the same
-        as :meth:`from_hdf5` on the same file — the axis-order rule stays in one place
-        rather than being reimplemented per entry point. Nothing is reopened.
-
-        Useful when you want the backend for its own sake first — ``be.shape``,
-        ``be.chunks``, ``be.stored_offset()`` — and then to look at it.
-        """
-        for attr in ("shape", "dtype", "read_region", "to_spec"):
-            if not hasattr(backend, attr):
-                raise ServeProblem(
-                    f"expected an open backend with .{attr}; got "
-                    f"{type(backend).__name__}. For a path use from_hdf5 / from_volume / "
-                    f"from_source, and for an array in memory use from_array")
-        spec = dict(backend.to_spec())
-        where = str(spec.get("path") or spec.get("source") or "backend")
-        return cls._from_read(
-            _read_source(where, None, None, level=0, crop=crop,
-                         voxel_size=voxel_size, backend=backend),
-            path=where, kind=kind, name=name, **kwargs)
 
     @classmethod
     def from_volume(cls, volume: str, kind: str | None = None, *, level: int = 0,
@@ -222,6 +184,23 @@ class ServedLayer:
             _read_source(volume, None, None, level=level, crop=crop,
                          voxel_size=voxel_size),
             path=volume, kind=kind, name=name, **kwargs)
+
+    @classmethod
+    def from_piece(cls, piece: Any, kind: str, *, name: str | None = None,
+                   **kwargs) -> "ServedLayer":
+        """A :class:`neu_lib.Piece` — an array that already carries its frame.
+
+            piece = neu_vol.read_piece("gt.h5:/z07901")
+            layer = ServedLayer.from_piece(piece, "segmentation")
+
+        The conversion goes this way round, and it has to: ``Piece`` lives in neu-lib, the
+        bottom tier, and a ``Piece.as_layer`` would mean the vocabulary package naming a
+        viewer type three tiers above it. neu-glance reading a neu-lib type is the allowed
+        direction.
+        """
+        return cls(array=piece.array, kind=kind,
+                   name=name or getattr(piece, "name", None), frame=piece.frame,
+                   **kwargs)
 
     @classmethod
     def from_source(cls, src: str, kind: str | None = None, *, level: int = 0,
@@ -260,6 +239,33 @@ class ServedLayer:
                    name=name or _default_name(path, read["dataset"]),
                    frame=read["frame"], channel_axis=read["channel_axis"], **kwargs)
 
+    # ------------------------------------------------------------ where it is
+    @property
+    def piece(self) -> Any:
+        """This layer's array and frame as a :class:`neu_lib.Piece`.
+
+        The type that answers the geometry questions — ``.bbox``, ``.bounds_nm``,
+        ``.crop()`` — so they are not reimplemented here. A layer is a *piece plus how to
+        draw it*, and this is the piece.
+        """
+        from neu_lib import Piece
+
+        if self.frame is None:
+            raise ServeProblem(
+                f"layer {self.name!r} has no frame, so it has no position to report. "
+                f"Build it with a voxel_size= or from a source that records one")
+        return Piece(array=self.array, frame=self.frame)
+
+    @property
+    def bbox(self) -> Any:
+        """Where this layer sits, in its frame's voxels. See :attr:`piece`."""
+        return self.piece.bbox
+
+    @property
+    def bounds_nm(self) -> Any:
+        """Where this layer sits, in nanometres. Also what ``crop=`` reads off a layer."""
+        return self.piece.bounds_nm
+
     def __post_init__(self) -> None:
         if self.kind not in KINDS:
             raise ServeProblem(f"kind must be one of {KINDS}, got {self.kind!r}")
@@ -284,19 +290,33 @@ class ServedLayer:
                 f"decides it")
 
 
-def _crop_box(crop: Any, what: str = "crop") -> tuple[tuple[int, ...], ...] | None:
-    """``crop`` as ``(lo, hi)`` in whole voxels, zyx, half-open.
+def _crop_request(crop: Any, what: str = "crop"):
+    """``(voxel_box, nm_bounds)`` — exactly one of them, or both ``None``.
 
-    Accepts ``((z0, y0, x0), (z1, y1, x1))`` and the flat ``(z0, y0, x0, z1, y1, x1)`` the
-    CLI takes, because writing one where the other is expected is the obvious slip and the
-    two are unambiguous by length.
+    Three ways to say which box you want, because there are three things a caller has in
+    hand:
 
-    **The units are VOXELS of the level being read, not nanometres.** A crop in nm is the
-    likelier mistake — the rest of this suite speaks nm — and it fails as an
-    out-of-extent error rather than as a wrong-looking picture, so the message says so.
+    * ``((z0,y0,x0), (z1,y1,x1))`` or the flat ``(z0,…,x1)``, in **whole voxels of the
+      level being read** — the direct form, and what the CLI takes;
+    * anything carrying ``bounds_nm`` — a :class:`neu_lib.Piece`, or another
+      :class:`ServedLayer` — meaning *the same physical box as that*. This is the one that
+      answers "show me the image under this ground-truth crop", and it is why
+      nanometres exist as the shared model space: the two frames have different voxel
+      sizes and different origins, so no voxel box is transferable between them.
+    * a ``{"nm": (lo, hi)}`` mapping, for a physical box with nothing to carry it.
+
+    Voxels are resolved here; nanometres cannot be, because converting them needs the
+    target level's own voxel size and origin, which are not known until it is opened.
     """
     if crop is None:
-        return None
+        return None, None
+    bounds = getattr(crop, "bounds_nm", None)
+    if bounds is not None:
+        return None, tuple(bounds)
+    if isinstance(crop, Mapping):
+        if "nm" not in crop:
+            raise ServeProblem(f"{what} mapping must carry 'nm': (lo, hi); got {crop!r}")
+        return None, tuple(crop["nm"])
     flat = tuple(crop)
     if len(flat) == 6 and all(np.isscalar(v) or isinstance(v, (int, float))
                              for v in flat):
@@ -306,10 +326,11 @@ def _crop_box(crop: Any, what: str = "crop") -> tuple[tuple[int, ...], ...] | No
     else:
         raise ServeProblem(
             f"{what} must be ((z0,y0,x0), (z1,y1,x1)) or (z0,y0,x0,z1,y1,x1) in whole "
-            f"VOXELS of the level being read — not nanometres — got {crop!r}")
+            f"VOXELS of the level being read, a Piece/ServedLayer to take the same "
+            f"physical box as, or {{'nm': (lo, hi)}} — got {crop!r}")
     if len(lo) != 3 or len(hi) != 3:
         raise ServeProblem(f"{what} corners are zyx, so 3 values each; got {lo} / {hi}")
-    return lo, hi
+    return (lo, hi), None
 
 
 def _read_source(path: str, dataset: str | None, fmt: str | None, *, level: int,
@@ -343,7 +364,7 @@ def _read_source(path: str, dataset: str | None, fmt: str | None, *, level: int,
                                          read_level_voxel_sizes, read_source_metadata,
                                          require_one_array)
 
-    crop = _crop_box(crop)
+    crop, crop_nm = _crop_request(crop)
     with quiet_reads():
         if backend is not None:
             spec = dict(backend.to_spec())
@@ -397,6 +418,40 @@ def _read_source(path: str, dataset: str | None, fmt: str | None, *, level: int,
 
         channel_axis = len(shape) == 4
         spatial = shape[1:] if channel_axis else shape
+        recorded = (tuple(float(o) for o in meta["offset"])
+                    if meta.get("offset") else (0.0, 0.0, 0.0))
+        if crop_nm is not None:
+            # A physical box, into THIS level's voxels — which needs the level's own voxel
+            # size and origin, and so cannot be done before it is opened. Grown outward, so
+            # the read contains the box asked for rather than dropping a face when the
+            # levels do not divide evenly.
+            box = Frame(voxel_size_nm=voxel, origin_nm=recorded).voxel_box(crop_nm)
+            crop = (tuple(max(0, v) for v in box.lo),
+                    tuple(min(e, v) for v, e in zip(box.hi, spatial)))
+            logger.info("crop %s nm -> level-%d voxels %s:%s", crop_nm, level, *crop)
+            if any(b <= a for a, b in zip(*crop)):
+                raise ServeProblem(
+                    f"the physical box {crop_nm} nm does not overlap {path}'s level-{level} "
+                    f"extent {spatial} at {voxel} nm/voxel starting {recorded} nm. If the "
+                    f"box came from another dataset's crop, the two are not the same "
+                    f"volume")
+            # **A clamp that removes most of the box means the wrong volume**, not an edge
+            # case. Taking a physical box off one dataset's crop and reading it out of
+            # another's image is the easy mistake — the numbers are plausible, the read
+            # succeeds, and what comes back is a thin slab nobody asked for. So say it, with
+            # the fraction, rather than logging the conversion and moving on.
+            asked = math.prod(b - a for a, b in zip(box.lo, box.hi))
+            got = math.prod(b - a for a, b in zip(*crop))
+            if got < asked:
+                clipped = [f"{'zyx'[a]} {box.lo[a]}:{box.hi[a]} -> {crop[0][a]}:{crop[1][a]}"
+                           for a in range(3) if (box.lo[a], box.hi[a]) != (crop[0][a],
+                                                                          crop[1][a])]
+                warn = logger.warning if got * 2 < asked else logger.info
+                warn("the physical box does not fit %s's level-%d extent %s and was "
+                     "clipped to %.0f%% of it (%s)%s", path, level, spatial,
+                     100.0 * got / asked, "; ".join(clipped),
+                     ". Losing most of a box usually means it came from a different "
+                     "dataset than this volume" if got * 2 < asked else "")
         lo = (0, 0, 0)
         if crop:
             lo, hi = crop
@@ -414,15 +469,9 @@ def _read_source(path: str, dataset: str | None, fmt: str | None, *, level: int,
         if channel_axis:
             region = (slice(0, shape[0]),) + region
 
-        shift = tuple(float(o) * v for o, v in zip(lo, voxel))
-        recorded = (tuple(float(o) for o in meta["offset"])
-                    if meta.get("offset") else None)
-        if recorded is None:
-            origin = shift
-        else:
-            # A crop out of something that already knows where it belongs lands at the
-            # SUM, the same rule `neu-vol to-hdf5 --crop-bbox` follows.
-            origin = tuple(a + b for a, b in zip(recorded, shift))
+        # A crop out of something that already knows where it belongs lands at the SUM,
+        # the same rule `neu-vol to-hdf5 --crop-bbox` follows.
+        origin = tuple(o + i * v for o, i, v in zip(recorded, lo, voxel))
 
         return {"array": backend.read_region(region),
                 "frame": Frame(voxel_size_nm=voxel, origin_nm=origin),

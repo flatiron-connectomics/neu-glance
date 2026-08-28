@@ -67,7 +67,23 @@ srv.selected_segments()              # label ids you clicked
 srv.on_click(lambda c: print(c.voxel, c.values))
 ```
 
-The three constructors follow one rule: **infer what the source records, require what it
+Taking the same physical box as something else — the "show me the image under this
+ground-truth crop" case — is what `crop=` does with a layer or a `neu_lib.Piece`:
+
+```python
+gt = ServedLayer.from_hdf5("gt.h5", "/vol_03700", "segmentation")
+em = ServedLayer.from_volume("s3://my-bucket/em", crop=gt)      # the same box, in nm
+em2 = ServedLayer.from_volume("s3://my-bucket/em", level=2, crop=gt)   # and coarser
+serve([em, gt])
+```
+
+Nanometres are the only space that transfers: the two frames have different voxel sizes
+*and* different origins, so a voxel box from one means nothing in the other. `layer.bbox`,
+`layer.bounds_nm` and `layer.piece` report where a layer is, and a box clipped to a
+fraction of what was asked for warns — losing most of it usually means it came from a
+different dataset than the volume.
+
+The constructors follow one rule: **infer what the source records, require what it
 does not.** A frame, a dataset name and the channel axis are all written down — in an HDF5
 file's attributes, a precomputed `info`, or the array's own rank — so reading them is not
 guessing, and dropping them is the silent failure. `kind` is asked for, because an HDF5 file
