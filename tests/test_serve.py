@@ -269,13 +269,20 @@ def test_a_name_collision_is_renamed_not_shadowed(frame, stop_server):
     assert "dup" in names and "dup_1" in names
 
 
-def test_an_annotation_layer_is_there_to_draw_in(frame, stop_server):
-    server = serve([ServedLayer(_labels(), name="a", frame=frame)])
-    assert any(lyr["name"] == "regions" for lyr in server.state()["layers"])
-    assert server.boxes() == [], "empty, but present and readable"
-
-    plain = serve([ServedLayer(_labels(), name="b", frame=frame)], regions=None)
+def test_the_annotation_layer_is_OPT_IN(frame, stop_server):
+    """A viewer that opens with a layer nobody asked for reads as a bug, and the read-back
+    loop is a deliberate workflow rather than something every look at a crop wants."""
+    plain = serve([ServedLayer(_labels(), name="b", frame=frame)])
     assert not any(lyr["name"] == "regions" for lyr in plain.state()["layers"])
+    with pytest.raises(ServeProblem, match="no annotation layer"):
+        plain.boxes()
+
+    asked = serve([ServedLayer(_labels(), name="a", frame=frame)], regions=True)
+    assert any(lyr["name"] == "regions" for lyr in asked.state()["layers"])
+    assert asked.boxes() == [], "empty, but present and readable"
+
+    named = serve([ServedLayer(_labels(), name="c", frame=frame)], regions="picks")
+    assert any(lyr["name"] == "picks" for lyr in named.state()["layers"])
 
 
 def test_nothing_to_serve_is_an_error(stop_server):
@@ -287,7 +294,7 @@ def test_nothing_to_serve_is_an_error(stop_server):
 def test_boxes_come_back_sorted_per_axis(frame, stop_server):
     """A box drawn up-and-left has point_a greater than point_b, and every consumer of a
     box in this suite expects half-open lo < hi."""
-    server = serve([ServedLayer(_labels(), name="a", frame=frame)])
+    server = serve([ServedLayer(_labels(), name="a", frame=frame)], regions=True)
     with server.viewer.txn() as s:
         s.layers["regions"].annotations = [
             ng.AxisAlignedBoundingBoxAnnotation(id="1", point_a=[9, 8, 7],
@@ -700,3 +707,52 @@ def test_a_physical_box_entirely_outside_raises(tmp_path):
                  frame=Frame(voxel_size_nm=(40, 8, 8), origin_nm=(99999, 0, 0)))
     with pytest.raises(ServeProblem, match="not the same volume"):
         ServedLayer.from_volume(vol, "image", crop=away)
+
+
+def test_the_viewer_opens_CENTRED_on_the_data_not_at_the_origin(frame, stop_server):
+    """Neuroglancer with no position opens at the origin CORNER and at one voxel per pixel,
+    so a crop sitting at voxel 3700 of its parent opens as empty space a long way from
+    anything, with nothing to say the data is elsewhere. `state.default_view` exists for
+    exactly this; `serve` just was not using it."""
+    layer = ServedLayer(_labels((8, 16, 16)), name="a", frame=frame)   # at voxel 10,20,30
+    state = serve([layer]).state()
+    assert "position" in state, "no position means the origin corner"
+    # the centre of the data, in the viewer's units (voxels of the frame)
+    lo, hi = layer.bbox.lo, layer.bbox.hi
+    want = [(a + b) / 2 for a, b in zip(lo, hi)]
+    assert [round(v, 3) for v in state["position"]] == [round(v, 3) for v in want]
+    # ...and scaled to the data rather than left at one voxel per pixel. The scale is
+    # voxels PER PIXEL, so fitting a 16-voxel extent into a nominal viewport is well under
+    # 1 — the number to check is that it tracks the extent, not that it is large.
+    from neu_glance.state import FIT_MARGIN, NOMINAL_VIEWPORT_PX
+
+    assert state["crossSectionScale"] == pytest.approx(
+        max(layer.piece.spatial_shape) * FIT_MARGIN / NOMINAL_VIEWPORT_PX)
+
+
+def test_the_opening_view_spans_EVERY_layer(stop_server):
+    """A small ground-truth crop over a larger image should frame both — the union, in nm,
+    because that is the only space two frames with different extents share."""
+    from neu_lib import Frame
+
+    small = ServedLayer(_labels((4, 4, 4)), name="gt", kind="segmentation",
+                        frame=Frame(voxel_size_nm=(8, 8, 8), origin_nm=(80, 80, 80)))
+    big = ServedLayer(_labels((32, 32, 32)), name="em",
+                      frame=Frame(voxel_size_nm=(8, 8, 8), origin_nm=(0, 0, 0)))
+    state = serve([big, small]).state()
+    # union is 0..256 nm = 0..32 voxels, so the centre is 16
+    assert [round(v) for v in state["position"]] == [16, 16, 16]
+
+
+def test_no_frame_anywhere_leaves_neuroglancers_own_default(stop_server):
+    """Nothing to centre on, so nothing is claimed."""
+    state = serve([ServedLayer(_labels(), name="a")]).state()
+    assert "position" not in state
+
+
+def test_the_cli_regions_flag_is_opt_in():
+    from neu_glance.cli import _parse_args
+
+    assert _parse_args(["serve", "--seg", "x.h5"]).regions is False
+    assert _parse_args(["serve", "--seg", "x.h5", "--regions"]).regions is True
+    assert _parse_args(["serve", "--seg", "x.h5", "--regions", "picks"]).regions == "picks"

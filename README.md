@@ -91,8 +91,14 @@ has nowhere agreed-on to record it and reading it off the dtype is the mistake n
 itself makes. A volume that records `info["type"]` is the exception, and then `from_volume`
 needs nothing.
 
-`srv.boxes()` is what closes the loop: pick a region in the viewer, hand it straight to
-`--crop-bbox`, `extract_roi` or `neu-vol write`.
+`srv.boxes()` closes the loop: pick a region in the viewer, hand it straight to
+`--crop-bbox`, `extract_roi` or `neu-vol write`. It needs an annotation layer to draw in,
+which is **opt-in** — `serve(..., regions=True)` or `--regions` — because a viewer that
+opens with a layer nobody asked for reads as a bug.
+
+The viewer opens **centred on the served data and zoomed to fit it**. Neuroglancer's own
+default is the origin *corner* at one voxel per pixel, which for a crop sitting at voxel
+3700 of its parent is a view of empty space a long way from anything.
 
 Three things about it that are not obvious:
 

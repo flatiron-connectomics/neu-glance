@@ -537,10 +537,11 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--into", default=None, metavar="PATH_OR_URL",
                    help="start from an existing state, given as a URL or a JSON file, and "
                         "add the served layers to it — keeping its view")
-    q.add_argument("--no-regions", dest="regions", action="store_false",
-                   help="omit the empty annotation layer. By default one is added to draw "
-                        "boxes in, which is what makes a region picked in the viewer "
-                        "reusable here")
+    q.add_argument("--regions", nargs="?", const=True, default=False, metavar="NAME",
+                   help="add an empty annotation layer to draw boxes in, read back by "
+                        "`Server.boxes()`. Off by default: a viewer that opens with a layer "
+                        "nobody asked for reads as a bug. Give a NAME to call it something "
+                        "else")
     q.set_defaults(func=cmd_serve)
 
     q = sub.add_parser(
@@ -918,7 +919,7 @@ def cmd_serve(args) -> int:
 
     try:
         server = serve(layers, bind=args.bind, port=args.port, into=into,
-                       regions="regions" if args.regions else None)
+                       regions=args.regions or None)
     except ServeProblem as e:
         raise SystemExit(str(e)) from None
 

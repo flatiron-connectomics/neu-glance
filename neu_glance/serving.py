@@ -57,8 +57,10 @@ ENCODING = "npz"
 #: tolerating a channel axis.
 from neu_lib import KINDS  # noqa: E402
 
-#: Name of the annotation layer a viewer gets for drawing boxes in, and the layer
-#: :meth:`Server.boxes` reads back.
+#: Name of the annotation layer :meth:`Server.boxes` reads back. **Opt-in**: a viewer that
+#: grows a layer nobody asked for is confusing, and the read-back loop is a deliberate
+#: workflow rather than something every look at a crop needs. Pass ``regions=True`` (or a
+#: name) to `serve`, or `--regions` on the command line.
 REGIONS_LAYER = "regions"
 
 
@@ -578,8 +580,34 @@ class Server:
         ng.server.stop()
 
 
+def _opening_view(layers: Sequence[ServedLayer]):
+    """``(position, cross_section_scale, projection_scale)`` framing every served layer.
+
+    In the **viewer's** units, which are voxels of the first layer's frame — the viewer's
+    ``dimensions`` declare a scale per axis and no origin, so a position is simply nm over
+    that scale. The box is the union across layers, in nm, because that is the only space
+    they share: a ground-truth crop and the image around it have different extents and
+    possibly different voxel sizes.
+
+    ``None`` when no layer carries a frame, in which case there is nothing to centre on and
+    neuroglancer's own default is as good an answer as any.
+    """
+    from .state import default_view
+
+    framed = [ln for ln in layers if ln.frame is not None]
+    if not framed:
+        return None
+    los, his = zip(*(ln.bounds_nm for ln in framed))
+    lo = tuple(min(v[a] for v in los) for a in range(3))
+    hi = tuple(max(v[a] for v in his) for a in range(3))
+    voxel = framed[0].frame.voxel_size_nm
+    extent = tuple((b - a) / v for a, b, v in zip(lo, hi, voxel))
+    offset = tuple(a / v for a, v in zip(lo, voxel))
+    return default_view(extent, offset)
+
+
 def serve(layers: Sequence[ServedLayer], *, bind: str | None = None, port: int = 0,
-          into: dict | None = None, regions: str | None = REGIONS_LAYER,
+          into: dict | None = None, regions: str | bool | None = None,
           position: Sequence[float] | None = None) -> Server:
     """Host ``layers`` and return a :class:`Server` carrying the viewer URL.
 
@@ -593,7 +621,14 @@ def serve(layers: Sequence[ServedLayer], *, bind: str | None = None, port: int =
     :func:`neu_glance.load_state` or :func:`neu_glance.parse_url`), keeping its view.
 
     ``regions`` adds an empty local annotation layer to draw in, read back by
-    :meth:`Server.boxes`. Pass ``None`` to leave it out.
+    :meth:`Server.boxes`. **Off by default** — it is a deliberate workflow, not something
+    every look at a crop wants, and a viewer that opens with a layer nobody asked for reads
+    as a bug. ``True`` for the default name, or a name of your own.
+
+    ``position`` overrides where the viewer opens. By default it is **centred on the served
+    data and zoomed to fit it**: neuroglancer with no position opens at the origin *corner*
+    and at one voxel per pixel, which for a crop at voxel 3700 is a view of empty space a
+    long way from anything.
     """
     ng = _neuroglancer()
     layers = [ServedLayer(**ln) if isinstance(ln, dict) else ln for ln in layers]
@@ -668,12 +703,22 @@ def serve(layers: Sequence[ServedLayer], *, bind: str | None = None, port: int =
                 s.layers[name] = ng.ImageLayer(**kwargs)
 
         if regions:
-            # Built here rather than on demand so there is something to draw in the moment
-            # the link opens; an empty layer costs nothing.
-            s.layers[regions] = ng.LocalAnnotationLayer(dimensions=spatial)
+            name = REGIONS_LAYER if regions is True else str(regions)
+            s.layers[name] = ng.LocalAnnotationLayer(dimensions=spatial)
+        # **Centre on the data and zoom to fit it.** `state.default_view`'s own docstring
+        # is about this: with no position neuroglancer opens at the origin CORNER, and with
+        # no crossSectionScale at one voxel per pixel — so a crop sitting at voxel 3700 of
+        # its parent opens as empty space, with nothing to say the data is elsewhere. The
+        # union of the layers' boxes, so a small crop over a larger image still frames both.
         if position is not None:
             s.position = [float(v) for v in position]
+        else:
+            view = _opening_view(layers)
+            if view is not None:
+                s.position, s.cross_section_scale, s.projection_scale = view
 
-    server = Server(viewer, volumes, regions if regions else None)
+    server = Server(viewer, volumes,
+                    (REGIONS_LAYER if regions is True else str(regions))
+                    if regions else None)
     logger.info("serving %d layer(s) at %s", len(volumes), server.url)
     return server
