@@ -62,6 +62,7 @@ _EXPORTS = {
     # Hosting arrays in this process. The module name differs from the export so the two
     # cannot collide: `neu_glance.serve` is the function, `neu_glance.serving` the module.
     "serve": "serving",
+    "stop_serving": "serving",
     "ServedLayer": "serving",
     "Server": "serving",
     "ServeProblem": "serving",

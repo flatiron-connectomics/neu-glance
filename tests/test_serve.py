@@ -726,7 +726,14 @@ def test_the_viewer_opens_CENTRED_on_the_data_not_at_the_origin(frame, stop_serv
     # 1 — the number to check is that it tracks the extent, not that it is large.
     from neu_glance.state import FIT_MARGIN, NOMINAL_VIEWPORT_PX
 
+    # ...and scaled so the piece fits its PANEL: `default_view` fits a whole window, and a
+    # 4-panel layout gives each cross-section about half of it in each direction.
     assert state["crossSectionScale"] == pytest.approx(
+        max(layer.piece.spatial_shape) * FIT_MARGIN / NOMINAL_VIEWPORT_PX / 0.5)
+    # a single-panel layout needs no such correction
+    single = serve([ServedLayer(_labels((8, 16, 16)), name="b", frame=frame)],
+                   layout="xy").state()
+    assert single["crossSectionScale"] == pytest.approx(
         max(layer.piece.spatial_shape) * FIT_MARGIN / NOMINAL_VIEWPORT_PX)
 
 
@@ -756,3 +763,62 @@ def test_the_cli_regions_flag_is_opt_in():
     assert _parse_args(["serve", "--seg", "x.h5"]).regions is False
     assert _parse_args(["serve", "--seg", "x.h5", "--regions"]).regions is True
     assert _parse_args(["serve", "--seg", "x.h5", "--regions", "picks"]).regions == "picks"
+
+
+def test_stop_serving_works_without_a_handle(frame, stop_server):
+    """The escape hatch for a re-run cell or an unassigned result: there is one server per
+    process, so it can be reached without the Server that started it."""
+    import neuroglancer as _ng
+
+    from neu_glance import stop_serving
+
+    assert stop_serving() is False, "nothing running yet"
+    serve([ServedLayer(_labels(), name="a", frame=frame)])          # result discarded
+    assert _ng.server.is_server_running()
+    assert stop_serving() is True
+    assert not _ng.server.is_server_running()
+    assert stop_serving() is False, "idempotent"
+
+
+def test_serve_does_not_block(frame, stop_server):
+    """Nothing here holds the notebook: the tornado server is a background daemon thread,
+    so a blocked cell is the *command* (`neu-glance serve` runs until interrupted), never
+    this."""
+    import threading
+    import time
+
+    before = threading.active_count()
+    start = time.monotonic()
+    server = serve([ServedLayer(_labels(), name="a", frame=frame)])
+    assert time.monotonic() - start < 10, "serve() returned promptly"
+    assert server.url
+    assert threading.active_count() > before, "...because the server is on its own thread"
+
+
+def test_stop_serving_works_without_a_handle(frame, stop_server):
+    """For a re-run cell or a result never assigned: there is one server per process, so it
+    can be reached without the Server that started it."""
+    import neuroglancer as _ng
+
+    from neu_glance import stop_serving
+
+    assert stop_serving() is False, "nothing running yet"
+    serve([ServedLayer(_labels(), name="a", frame=frame)])          # result discarded
+    assert _ng.server.is_server_running()
+    assert stop_serving() is True
+    assert not _ng.server.is_server_running()
+    assert stop_serving() is False, "idempotent"
+
+
+def test_serve_does_not_block(frame, stop_server):
+    """Nothing in the library holds the caller: the tornado server is a background daemon
+    thread. A blocked notebook cell is therefore the *command* — `neu-glance serve` runs
+    until interrupted, which in a cell means until the kernel is interrupted."""
+    import threading
+    import time
+
+    before = threading.active_count()
+    start = time.monotonic()
+    server = serve([ServedLayer(_labels(), name="a", frame=frame)])
+    assert time.monotonic() - start < 20, "serve() returned promptly"
+    assert server.url and threading.active_count() > before

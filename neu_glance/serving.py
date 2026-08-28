@@ -575,12 +575,51 @@ class Server:
         return path
 
     def stop(self) -> None:
-        """Stop the shared server, invalidating every viewer URL in this process."""
-        ng = _neuroglancer()
-        ng.server.stop()
+        """Stop the server, invalidating every viewer URL in this process.
+
+        **One server per process, shared by every viewer**, so this stops them all — that
+        is neuroglancer's design, not a shortcut here. See :func:`stop_serving` for the
+        same thing without a handle.
+        """
+        stop_serving()
 
 
-def _opening_view(layers: Sequence[ServedLayer]):
+#: How much of the window each cross-section panel gets, per layout. `default_view` fits
+#: against a nominal **window**, which is right for a link someone opens full-screen; a
+#: 4-panel view gives each slice about half of it in each direction, so fitting to the
+#: window leaves the piece overflowing its panel. This is the correction, and it is a
+#: fraction rather than a pixel count because the real window size is not knowable here.
+_PANEL_FRACTION = {
+    "4panel": 0.5, "xy-3d": 0.5, "yz-3d": 0.5, "xz-3d": 0.5,
+    "xy": 1.0, "yz": 1.0, "xz": 1.0, "3d": 1.0,
+}
+
+
+def stop_serving() -> bool:
+    """Stop the viewer server, whatever started it. ``True`` if one was running.
+
+    The escape hatch for a lost handle — a re-run cell, a renamed variable, a `serve` whose
+    result was never assigned. There is **one server per process** and it is a background
+    daemon thread, so this reaches it without needing the :class:`Server` that started it,
+    and every viewer URL in the process goes dead.
+
+        neu_glance.stop_serving()
+
+    Nothing here ever blocks the notebook, so if a cell is stuck it is the *command* —
+    ``neu-glance serve`` runs until interrupted, and in a cell that means forever. Interrupt
+    the kernel for that one. Failing everything, the server dies with the kernel, because a
+    daemon thread does.
+    """
+    ng = _neuroglancer()
+    if not ng.server.is_server_running():
+        return False
+    ng.server.stop()
+    logger.info("viewer server stopped; every link from this process is now dead")
+    return True
+
+
+def _opening_view(layers: Sequence[ServedLayer], *, layout: str = "4panel",
+                  fit: float = 1.0):
     """``(position, cross_section_scale, projection_scale)`` framing every served layer.
 
     In the **viewer's** units, which are voxels of the first layer's frame — the viewer's
@@ -588,6 +627,10 @@ def _opening_view(layers: Sequence[ServedLayer]):
     that scale. The box is the union across layers, in nm, because that is the only space
     they share: a ground-truth crop and the image around it have different extents and
     possibly different voxel sizes.
+
+    Scaled up by the layout's panel fraction, so the **whole** piece is inside its panel
+    rather than inside a hypothetical full-window view of it. ``fit`` multiplies that again:
+    above 1 shows more around the data, below 1 fills more of the panel.
 
     ``None`` when no layer carries a frame, in which case there is nothing to centre on and
     neuroglancer's own default is as good an answer as any.
@@ -603,12 +646,15 @@ def _opening_view(layers: Sequence[ServedLayer]):
     voxel = framed[0].frame.voxel_size_nm
     extent = tuple((b - a) / v for a, b, v in zip(lo, hi, voxel))
     offset = tuple(a / v for a, v in zip(lo, voxel))
-    return default_view(extent, offset)
+    centre, cross, projection = default_view(extent, offset)
+    scale = fit / _PANEL_FRACTION.get(layout, 0.5)
+    return centre, cross * scale, projection * scale
 
 
 def serve(layers: Sequence[ServedLayer], *, bind: str | None = None, port: int = 0,
           into: dict | None = None, regions: str | bool | None = None,
-          position: Sequence[float] | None = None) -> Server:
+          position: Sequence[float] | None = None, layout: str = "4panel",
+          fit: float = 1.0) -> Server:
     """Host ``layers`` and return a :class:`Server` carrying the viewer URL.
 
     ``bind`` / ``port`` set the address the browser must reach. **They take effect only
@@ -626,9 +672,12 @@ def serve(layers: Sequence[ServedLayer], *, bind: str | None = None, port: int =
     as a bug. ``True`` for the default name, or a name of your own.
 
     ``position`` overrides where the viewer opens. By default it is **centred on the served
-    data and zoomed to fit it**: neuroglancer with no position opens at the origin *corner*
-    and at one voxel per pixel, which for a crop at voxel 3700 is a view of empty space a
-    long way from anything.
+    data and zoomed so the whole piece is in each panel**: neuroglancer with no position
+    opens at the origin *corner* and at one voxel per pixel, which for a crop at voxel 3700
+    is a view of empty space a long way from anything.
+
+    ``layout`` is passed through and also decides the fit, since a 4-panel view gives each
+    cross-section about half the window. ``fit`` above 1 shows more around the data.
     """
     ng = _neuroglancer()
     layers = [ServedLayer(**ln) if isinstance(ln, dict) else ln for ln in layers]
@@ -713,12 +762,15 @@ def serve(layers: Sequence[ServedLayer], *, bind: str | None = None, port: int =
         if position is not None:
             s.position = [float(v) for v in position]
         else:
-            view = _opening_view(layers)
+            view = _opening_view(layers, layout=layout, fit=fit)
             if view is not None:
                 s.position, s.cross_section_scale, s.projection_scale = view
+        if layout and not (into and into.get("layout")):
+            s.layout = layout
 
     server = Server(viewer, volumes,
                     (REGIONS_LAYER if regions is True else str(regions))
                     if regions else None)
-    logger.info("serving %d layer(s) at %s", len(volumes), server.url)
+    logger.info("serving %d layer(s) at %s — .stop() or neu_glance.stop_serving() to end it",
+                len(volumes), server.url)
     return server
