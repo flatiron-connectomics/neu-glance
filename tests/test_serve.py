@@ -522,3 +522,103 @@ def test_a_coarser_level_reports_its_OWN_voxel_size(tmp_path):
 
     assert tuple(ServedLayer.from_volume(vol, level=1).frame.voxel_size_nm) \
         == (40.0, 16.0, 16.0)
+
+
+# --- the bugs a real session found ----------------------------------------- #
+def _ome_volume(tmp_path, kind="image", dtype="uint8"):
+    """A multiscale zarr GROUP, which is what `convert` writes and what broke."""
+    from neu_vol import convert
+    from neu_vol.backends.tensorstore import TensorStoreBackend
+    from neu_vol.profiles import zarr3_create_spec
+
+    src = str(tmp_path / "src.zarr")
+    be = TensorStoreBackend.create(
+        zarr3_create_spec("local", src, (16, 32, 32), dtype,
+                          dimension_names=("z", "y", "x"), chunk=(8, 8, 8)),
+        delete_existing=True)
+    be.write_region(tuple(slice(0, s) for s in (16, 32, 32)),
+                    _labels((16, 32, 32), dtype))
+    vol = str(tmp_path / "vol.zarr")
+    convert(src, vol, voxel_size=(40, 8, 8), kind=kind, profile="local",
+            chunk=(8, 8, 8), factors=[(1, 2, 2)], min_dim=8, delete_existing=True)
+    return vol
+
+
+def test_level_0_of_a_multiscale_ZARR_opens(tmp_path):
+    """The regression. A zarr OME group is **not an array**, so level 0 has to go through
+    the metadata's own `data_spec`, which names the level's subdirectory — addressing the
+    group path failed to open at all, with a tensorstore error naming `zarr.json`.
+
+    It hid because the two formats differ here: precomputed selects a scale with
+    `scale_index` on one path and worked fine, and so did zarr at level 1, which does get
+    a subdirectory. Only zarr level 0 was broken — the default.
+    """
+    vol = _ome_volume(tmp_path)
+    assert ServedLayer.from_volume(vol, level=0).array.shape == (16, 32, 32)
+    assert ServedLayer.from_volume(vol).array.shape == (16, 32, 32), "level 0 by default"
+    assert ServedLayer.from_volume(vol, level=1).array.shape == (16, 16, 16)
+    # and with a crop, which is how it was actually hit
+    assert ServedLayer.from_volume(
+        vol, crop=((0, 0, 0), (8, 16, 16))).array.shape == (8, 16, 16)
+
+
+def test_a_bare_zarr_array_still_works(tmp_path):
+    """It carries a `zarr.json` too, so detection calls it zarr3 while it has no levels —
+    addressing it as `<path>/0` would find nothing. Same distinction `copy` makes."""
+    from neu_vol.backends.tensorstore import TensorStoreBackend
+    from neu_vol.profiles import zarr3_create_spec
+
+    bare = str(tmp_path / "bare.zarr")
+    be = TensorStoreBackend.create(
+        zarr3_create_spec("local", bare, (8, 8, 8), "uint8",
+                          dimension_names=("z", "y", "x"), chunk=(8, 8, 8)),
+        delete_existing=True)
+    be.write_region(tuple(slice(0, 8) for _ in range(3)), _labels((8, 8, 8), "uint8"))
+    layer = ServedLayer.from_volume(bare, "image", voxel_size=(8, 8, 8))
+    assert layer.array.shape == (8, 8, 8)
+
+
+def test_a_crop_takes_either_shape():
+    """`((lo), (hi))` and the flat `(z0,y0,x0,z1,y1,x1)` the CLI takes. Writing one where
+    the other is expected is the obvious slip, and the two are unambiguous by length."""
+    from neu_glance.serving import _crop_box
+
+    assert _crop_box(((1, 2, 3), (4, 5, 6))) == ((1, 2, 3), (4, 5, 6))
+    assert _crop_box((1, 2, 3, 4, 5, 6)) == ((1, 2, 3), (4, 5, 6))
+    assert _crop_box(None) is None
+    with pytest.raises(ServeProblem, match="whole VOXELS"):
+        _crop_box((1, 2, 3, 4))
+    with pytest.raises(ServeProblem, match="3 values each"):
+        _crop_box(((1, 2), (3, 4)))
+
+
+def test_a_crop_given_in_NANOMETRES_says_so(tmp_path):
+    """The likelier mistake, since the rest of the suite speaks nm — and it surfaces as an
+    out-of-extent error rather than a wrong-looking picture, so the message has to say
+    which units it wanted."""
+    vol = _ome_volume(tmp_path)
+    with pytest.raises(ServeProblem, match="whole VOXELS"):
+        ServedLayer.from_volume(vol, crop=((0, 0, 0), (640, 256, 256)))
+    with pytest.raises(ServeProblem, match="NANOMETRES"):
+        ServedLayer.from_volume(vol, crop=((0, 0, 0), (6400, 2560, 2560)))
+
+
+def test_from_backend_agrees_with_from_hdf5(tmp_path):
+    """Both read the frame through the same `to_spec()` metadata, so the axis-order rule
+    lives in one place rather than once per entry point."""
+    from neu_vol import open_hdf5
+
+    path = _piece(tmp_path, voxel_size=np.asarray([40.0, 8.0, 8.0]),
+                  voxel_offset=np.asarray([2, 3, 4], "int64"), axes="zyx")
+    be = open_hdf5(path)
+    direct = ServedLayer.from_hdf5(path, kind="segmentation")
+    from_be = ServedLayer.from_backend(be, "segmentation")
+    dispatched = ServedLayer.from_hdf5(be, "segmentation")   # the obvious thing to try
+    assert direct.frame == from_be.frame == dispatched.frame
+    np.testing.assert_array_equal(direct.array, from_be.array)
+    assert from_be.name == dispatched.name == "data"
+
+
+def test_from_backend_refuses_something_that_is_not_one():
+    with pytest.raises(ServeProblem, match="expected an open backend"):
+        ServedLayer.from_backend(np.zeros((4, 4, 4)), "image")

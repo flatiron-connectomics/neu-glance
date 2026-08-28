@@ -40,6 +40,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 #: The one encoding that survives NumPy 2 — see the module docstring. Not a parameter
@@ -152,11 +154,51 @@ class ServedLayer:
 
         The format is forced rather than detected, so a file whose extension detection does
         not recognise still opens.
+
+        An already-open ``HDF5Backend`` is accepted in place of the path and forwarded to
+        :meth:`from_backend` — that is the obvious thing to try, so it works rather than
+        failing on ``str()`` of a backend.
         """
+        if not isinstance(path, (str, bytes)) and not hasattr(path, "__fspath__"):
+            if dataset is not None and kind is None:
+                # from_hdf5(backend, "segmentation") — the second positional is the kind
+                dataset, kind = None, dataset
+            return cls.from_backend(path, kind, crop=crop, name=name,
+                                    voxel_size=voxel_size, **kwargs)
         return cls._from_read(
-            _read_source(path, dataset, "hdf5", level=0, crop=crop,
+            _read_source(str(path), dataset, "hdf5", level=0, crop=crop,
                          voxel_size=voxel_size),
-            path=path, kind=kind, name=name, **kwargs)
+            path=str(path), kind=kind, name=name, **kwargs)
+
+    @classmethod
+    def from_backend(cls, backend: Any, kind: str | None = None, *, crop: Any = None,
+                     name: str | None = None,
+                     voxel_size: Sequence[float] | None = None,
+                     **kwargs) -> "ServedLayer":
+        """A backend you already have open — from ``neu_vol.open_hdf5``, say.
+
+            be = neu_vol.open_hdf5("gt.h5", "/z07901")
+            layer = ServedLayer.from_backend(be, "segmentation")
+
+        The frame is read through the backend's own ``to_spec()``, so it comes out the same
+        as :meth:`from_hdf5` on the same file — the axis-order rule stays in one place
+        rather than being reimplemented per entry point. Nothing is reopened.
+
+        Useful when you want the backend for its own sake first — ``be.shape``,
+        ``be.chunks``, ``be.stored_offset()`` — and then to look at it.
+        """
+        for attr in ("shape", "dtype", "read_region", "to_spec"):
+            if not hasattr(backend, attr):
+                raise ServeProblem(
+                    f"expected an open backend with .{attr}; got "
+                    f"{type(backend).__name__}. For a path use from_hdf5 / from_volume / "
+                    f"from_source, and for an array in memory use from_array")
+        spec = dict(backend.to_spec())
+        where = str(spec.get("path") or spec.get("source") or "backend")
+        return cls._from_read(
+            _read_source(where, None, None, level=0, crop=crop,
+                         voxel_size=voxel_size, backend=backend),
+            path=where, kind=kind, name=name, **kwargs)
 
     @classmethod
     def from_volume(cls, volume: str, kind: str | None = None, *, level: int = 0,
@@ -242,86 +284,152 @@ class ServedLayer:
                 f"decides it")
 
 
+def _crop_box(crop: Any, what: str = "crop") -> tuple[tuple[int, ...], ...] | None:
+    """``crop`` as ``(lo, hi)`` in whole voxels, zyx, half-open.
+
+    Accepts ``((z0, y0, x0), (z1, y1, x1))`` and the flat ``(z0, y0, x0, z1, y1, x1)`` the
+    CLI takes, because writing one where the other is expected is the obvious slip and the
+    two are unambiguous by length.
+
+    **The units are VOXELS of the level being read, not nanometres.** A crop in nm is the
+    likelier mistake — the rest of this suite speaks nm — and it fails as an
+    out-of-extent error rather than as a wrong-looking picture, so the message says so.
+    """
+    if crop is None:
+        return None
+    flat = tuple(crop)
+    if len(flat) == 6 and all(np.isscalar(v) or isinstance(v, (int, float))
+                             for v in flat):
+        lo, hi = tuple(int(v) for v in flat[:3]), tuple(int(v) for v in flat[3:])
+    elif len(flat) == 2:
+        lo, hi = tuple(int(v) for v in flat[0]), tuple(int(v) for v in flat[1])
+    else:
+        raise ServeProblem(
+            f"{what} must be ((z0,y0,x0), (z1,y1,x1)) or (z0,y0,x0,z1,y1,x1) in whole "
+            f"VOXELS of the level being read — not nanometres — got {crop!r}")
+    if len(lo) != 3 or len(hi) != 3:
+        raise ServeProblem(f"{what} corners are zyx, so 3 values each; got {lo} / {hi}")
+    return lo, hi
+
+
 def _read_source(path: str, dataset: str | None, fmt: str | None, *, level: int,
-                 crop: Any, voxel_size: Any) -> dict:
+                 crop: Any, voxel_size: Any, backend: Any = None) -> dict:
     """Read one source and everything known about it. The shared half of the constructors.
 
-    Returns ``{array, frame, channel_axis, kind, why}`` — ``kind`` being whatever the
-    source *records*, or ``None`` when it records nothing and inference has to decide.
-    A precomputed volume records it in ``info["type"]``, which is authoritative and must
-    never be second-guessed: getting it wrong averages label ids into ids that were never
-    in the data. An HDF5 file has nowhere agreed-on to say, so it records nothing.
+    Returns ``{array, frame, channel_axis, kind, dataset, format}`` — ``kind`` being
+    whatever the source *records*, or ``None`` when it records nothing and the caller has
+    to say. A precomputed volume records it in ``info["type"]`` and OME in the multiscales
+    ``type``, which is authoritative and must never be second-guessed: getting it wrong
+    averages label ids into ids that were never in the data. An HDF5 file has nowhere
+    agreed-on to say, so it records nothing.
+
+    ``backend`` short-circuits the opening for a caller that already has one; its
+    ``to_spec()`` still supplies the metadata, so the frame is read the same way either
+    way and the axis-order rule stays in one place.
 
     The frame travels with the array, and a crop shifts its origin — which is what keeps a
     served box on top of the volume it came from rather than at nm zero (invariant 1).
+
+    Every store read here is wrapped in ``neu_vol.logs.quiet_reads``. These constructors
+    are called straight from a notebook, so from the caller's point of view they *are* the
+    entry point and there is no ``main()`` to wrap — and an S3 open logs two
+    ``AuthCredentialsProvider`` lines at ``E`` severity per prefix that are **not**
+    failures, only the two providers that missed before the environment one succeeded.
     """
     from neu_lib import Frame
     from neu_vol import describe, open_backend
+    from neu_vol.logs import quiet_reads
     from neu_vol.source_metadata import (level_spec, location_spec,
                                          read_level_voxel_sizes, read_source_metadata,
                                          require_one_array)
 
-    if fmt is None:
-        described = describe(path, dataset=dataset or None)
-        if described["shape"] is None:
-            require_one_array(described, path, "neu-glance serve")
-        fmt, spec, meta = described["format"], described["spec"], described["meta"] or {}
-        dataset = described.get("dataset") or dataset
-    else:
-        # A format named outright, for a file whose name detection would not recognise.
-        spec = location_spec(path, fmt, dataset=dataset or None)
-        meta = read_source_metadata(spec) or {}
-        dataset = spec.get("dataset") or dataset
+    crop = _crop_box(crop)
+    with quiet_reads():
+        if backend is not None:
+            spec = dict(backend.to_spec())
+            fmt = fmt or spec.get("backend")
+            dataset = spec.get("dataset") or dataset
+            meta = read_source_metadata(spec) or {}
+        elif fmt is None:
+            described = describe(path, dataset=dataset or None)
+            if described["shape"] is None:
+                require_one_array(described, path, "neu-glance serve")
+            fmt = described["format"]
+            spec = described["spec"]
+            meta = described["meta"] or {}
+            dataset = described.get("dataset") or dataset
+        else:
+            # A format named outright, for a file whose name detection would not recognise.
+            spec = location_spec(path, fmt, dataset=dataset or None)
+            meta = read_source_metadata(spec) or {}
+            dataset = spec.get("dataset") or dataset
 
-    single = fmt in ("hdf5", "image_stack")
-    if level and single:
-        raise ServeProblem(
-            f"level {level} needs a multiscale volume; {path} is {fmt}, a single array")
-    read_spec = spec if (single or not level) else level_spec(
-        path, fmt, level, dataset=dataset or None)
+        single = fmt in ("hdf5", "image_stack")
+        if level and single:
+            raise ServeProblem(
+                f"level {level} needs a multiscale volume; {path} is {fmt}, a single array")
 
-    backend = open_backend(read_spec)
-    shape = tuple(int(s) for s in backend.shape)
-    per_level = read_level_voxel_sizes(spec) or []
-    voxel = (tuple(voxel_size) if voxel_size
-             else (tuple(per_level[level]) if level < len(per_level) else None)
-             or (tuple(meta["voxel_size"]) if meta.get("voxel_size") else None))
-    if voxel is None:
-        raise ServeProblem(
-            f"{path} records no voxel size, so nothing here knows its physical scale; "
-            f"pass voxel_size=(z, y, x)")
+        # **A zarr OME group is not an array**, so level 0 must go through the metadata's
+        # own `data_spec` (which names the level's subdirectory) rather than the group
+        # path. Addressing the path directly failed to open at all — the same trap
+        # `ops/pack.py` documents, and it hid because precomputed selects a scale with
+        # `scale_index` on one path and so worked fine.
+        if backend is not None:
+            read_spec = spec
+        elif single:
+            read_spec = spec
+        elif level:
+            read_spec = level_spec(path, fmt, level, dataset=dataset or None)
+        elif meta.get("data_spec"):
+            read_spec = meta["data_spec"]
+        else:
+            read_spec = spec          # a bare array: it has no levels to descend into
+        backend = backend or open_backend(read_spec)
+        shape = tuple(int(s) for s in backend.shape)
+        per_level = read_level_voxel_sizes(spec) or []
+        voxel = (tuple(voxel_size) if voxel_size
+                 else (tuple(per_level[level]) if level < len(per_level) else None)
+                 or (tuple(meta["voxel_size"]) if meta.get("voxel_size") else None))
+        if voxel is None:
+            raise ServeProblem(
+                f"{path} records no voxel size, so nothing here knows its physical "
+                f"scale; pass voxel_size=(z, y, x)")
 
-    channel_axis = len(shape) == 4
-    spatial = shape[1:] if channel_axis else shape
-    lo = (0, 0, 0)
-    if crop:
-        lo, hi = (tuple(crop[0]), tuple(crop[1]))
-        for axis, (start, stop, extent) in enumerate(zip(lo, hi, spatial)):
-            if not 0 <= start < stop <= extent:
-                raise ServeProblem(
-                    f"crop {lo}:{hi} does not fit {path}'s level-{level} extent "
-                    f"{spatial} on axis {axis}")
-        region = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
-    else:
-        region = tuple(slice(0, int(s)) for s in spatial)
-    if channel_axis:
-        region = (slice(0, shape[0]),) + region
+        channel_axis = len(shape) == 4
+        spatial = shape[1:] if channel_axis else shape
+        lo = (0, 0, 0)
+        if crop:
+            lo, hi = crop
+            for axis, (start, stop, extent) in enumerate(zip(lo, hi, spatial)):
+                if not 0 <= start < stop <= extent:
+                    nm = " — a crop in NANOMETRES looks like this" if any(
+                        v > e * 4 for v, e in zip(hi, spatial)) else ""
+                    raise ServeProblem(
+                        f"crop {lo}:{hi} does not fit {path}'s level-{level} extent "
+                        f"{spatial} on axis {axis}. The box is in whole VOXELS of that "
+                        f"level, zyx, half-open{nm}")
+            region = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
+        else:
+            region = tuple(slice(0, int(s)) for s in spatial)
+        if channel_axis:
+            region = (slice(0, shape[0]),) + region
 
-    shift = tuple(float(o) * v for o, v in zip(lo, voxel))
-    recorded = tuple(float(o) for o in meta["offset"]) if meta.get("offset") else None
-    if recorded is None:
-        origin = shift
-    else:
-        # A crop out of a piece that already knows where it belongs lands at the SUM, the
-        # same rule `neu-vol to-hdf5 --crop-bbox` follows.
-        origin = tuple(a + b for a, b in zip(recorded, shift))
+        shift = tuple(float(o) * v for o, v in zip(lo, voxel))
+        recorded = (tuple(float(o) for o in meta["offset"])
+                    if meta.get("offset") else None)
+        if recorded is None:
+            origin = shift
+        else:
+            # A crop out of something that already knows where it belongs lands at the
+            # SUM, the same rule `neu-vol to-hdf5 --crop-bbox` follows.
+            origin = tuple(a + b for a, b in zip(recorded, shift))
 
-    return {"array": backend.read_region(region),
-            "frame": Frame(voxel_size_nm=voxel, origin_nm=origin),
-            "channel_axis": channel_axis,
-            "kind": meta.get("kind"),
-            "dataset": dataset,
-            "format": fmt}
+        return {"array": backend.read_region(region),
+                "frame": Frame(voxel_size_nm=voxel, origin_nm=origin),
+                "channel_axis": channel_axis,
+                "kind": meta.get("kind"),
+                "dataset": dataset,
+                "format": fmt}
 
 
 def _default_name(path: str, dataset: str | None) -> str:

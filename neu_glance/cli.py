@@ -343,6 +343,12 @@ def build_parser() -> argparse.ArgumentParser:
                     "inline annotation layer makes for a long one.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version", version=f"neu-glance {__version__}")
+    p.add_argument("--store-logs", action="store_true",
+                   help="do not filter the store's own logging. The S3 driver emits two "
+                        "AuthCredentialsProvider lines per prefix at ERROR severity that "
+                        "are not failures — they record the providers that missed before "
+                        "the environment one succeeded — so they are filtered by default. "
+                        "PERMISSION_DENIED and AccessDenied are never filtered")
     sub = p.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     # --- gen ----------------------------------------------------------------
@@ -964,12 +970,25 @@ def cmd_shaders(args) -> int:
 
 
 def main(argv=None) -> int:
+    """Dispatch, with store logging filtered unless ``--store-logs`` asks for it.
+
+    Every subcommand here but `parse` and `shaders` reads a store, and an S3 open emits two
+    `AuthCredentialsProvider` lines at `E` severity **per prefix** that are not failures —
+    only the two providers that missed before the environment one succeeded. The marker of
+    a real problem is `PERMISSION_DENIED` / `AccessDenied`, and `logs.NEVER_DROP` keeps
+    those. Same wrapping neu-vol and neu-morpho do in their own `main()`.
+    """
     import logging
 
     logging.basicConfig(level=logging.WARNING,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     args = _parse_args(argv)
-    return args.func(args)
+    if getattr(args, "store_logs", False):
+        return args.func(args)
+    from neu_vol.logs import quiet_store_logs
+
+    with quiet_store_logs(True):
+        return args.func(args)
 
 
 if __name__ == "__main__":
