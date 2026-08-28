@@ -409,7 +409,10 @@ def test_from_hdf5_takes_the_frame_the_file_records(tmp_path):
     assert layer.array.shape == (6, 8, 8)
     assert tuple(layer.frame.voxel_size_nm) == (40.0, 8.0, 8.0)
     assert tuple(layer.frame.origin_nm) == (80.0, 24.0, 32.0)
-    assert layer.name == "data", "the dataset names the layer"
+    # With no dataset named, the FILE stem names the layer: `read_piece` resolves the sole
+    # dataset internally, and `piece` is more use than the generic `/data` it resolved to.
+    # Naming one explicitly still wins — see the container test below.
+    assert layer.name == "piece"
 
 
 def test_from_hdf5_needs_a_kind_and_says_why(tmp_path):
@@ -581,14 +584,16 @@ def test_a_bare_zarr_array_still_works(tmp_path):
 def test_a_crop_takes_either_shape():
     """`((lo), (hi))` and the flat `(z0,y0,x0,z1,y1,x1)` the CLI takes. Writing one where
     the other is expected is the obvious slip, and the two are unambiguous by length."""
-    from neu_glance.serving import _crop_request
+    # The crop vocabulary moved down to neu-vol with the reader: what a box
+    # may be is a property of reading, not of serving.
+    from neu_vol.piece import _crop_request
 
     assert _crop_request(((1, 2, 3), (4, 5, 6))) == (((1, 2, 3), (4, 5, 6)), None)
     assert _crop_request((1, 2, 3, 4, 5, 6)) == (((1, 2, 3), (4, 5, 6)), None)
     assert _crop_request(None) == (None, None)
-    with pytest.raises(ServeProblem, match="VOXELS"):
+    with pytest.raises(ValueError, match="VOXELS"):
         _crop_request((1, 2, 3, 4))
-    with pytest.raises(ServeProblem, match="3 values each"):
+    with pytest.raises(ValueError, match="3 values each"):
         _crop_request(((1, 2), (3, 4)))
 
 

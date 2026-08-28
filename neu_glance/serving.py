@@ -50,9 +50,12 @@ logger = logging.getLogger(__name__)
 #: everything here has reported success.
 ENCODING = "npz"
 
-#: What a served array can be. `probability` is an image as far as neuroglancer is
-#: concerned; it differs in the shader it gets and in tolerating a channel axis.
-KINDS = ("image", "segmentation", "probability")
+#: What a served array can be — neu-lib's vocabulary, imported rather than copied. `kind`
+#: is a fact about the DATA (it decides mean vs mode when coarsening), so it is owned down
+#: there; a viewer and a downsampler must not end up with two lists. `probability` is an
+#: image as far as neuroglancer is concerned, differing only in the shader it gets and in
+#: tolerating a channel axis.
+from neu_lib import KINDS  # noqa: E402
 
 #: Name of the annotation layer a viewer gets for drawing boxes in, and the layer
 #: :meth:`Server.boxes` reads back.
@@ -136,6 +139,26 @@ class ServedLayer:
                    channel_axis=channel_axis, **kwargs)
 
     @classmethod
+    def _read(cls, src: Any, kind: str | None, name: str | None, *, path: str,
+              **read_kwargs) -> "ServedLayer":
+        """Read through ``neu_vol.read_piece`` and wrap it. Shared by the three readers.
+
+        The reading lives in neu-vol, not here: it opens stores, `write` and `to-hdf5` want
+        it too, and this package used to carry a second copy of it.
+        """
+        from neu_vol import read_piece
+
+        try:
+            piece = read_piece(src, kind, **read_kwargs)
+        except ValueError as e:
+            # neu-vol speaks ValueError; this package's callers — and its CLI — catch
+            # ServeProblem. Translated rather than left to leak, so `except ServeProblem`
+            # around a constructor means what it says.
+            raise ServeProblem(str(e)) from None
+        return cls.from_piece(
+            piece, name=name or _default_name(path, read_kwargs.get("dataset")))
+
+    @classmethod
     def from_hdf5(cls, path: str, dataset: str | None = None, kind: str | None = None, *,
                   crop: Any = None, name: str | None = None,
                   voxel_size: Sequence[float] | None = None, **kwargs) -> "ServedLayer":
@@ -157,10 +180,8 @@ class ServedLayer:
         not recognise still opens.
 
         """
-        return cls._from_read(
-            _read_source(str(path), dataset, "hdf5", level=0, crop=crop,
-                         voxel_size=voxel_size),
-            path=str(path), kind=kind, name=name, **kwargs)
+        return cls._read(str(path), kind, name, path=str(path), dataset=dataset,
+                         src_format="hdf5", crop=crop, voxel_size=voxel_size, **kwargs)
 
     @classmethod
     def from_volume(cls, volume: str, kind: str | None = None, *, level: int = 0,
@@ -180,24 +201,37 @@ class ServedLayer:
 
         A whole volume is usually far too large to hold in memory — pass ``crop``.
         """
-        return cls._from_read(
-            _read_source(volume, None, None, level=level, crop=crop,
-                         voxel_size=voxel_size),
-            path=volume, kind=kind, name=name, **kwargs)
+        return cls._read(volume, kind, name, path=volume, level=level, crop=crop,
+                         voxel_size=voxel_size, **kwargs)
 
     @classmethod
-    def from_piece(cls, piece: Any, kind: str, *, name: str | None = None,
+    def from_piece(cls, piece: Any, kind: str | None = None, *, name: str | None = None,
                    **kwargs) -> "ServedLayer":
-        """A :class:`neu_lib.Piece` — an array that already carries its frame.
+        """A :class:`neu_lib.Piece` — an array that already carries its frame and kind.
 
-            piece = neu_vol.read_piece("gt.h5:/z07901")
-            layer = ServedLayer.from_piece(piece, "segmentation")
+            piece = neu_vol.read_piece("gt.h5:/vol_03700", "segmentation")
+            layer = ServedLayer.from_piece(piece)
+
+        ``kind`` defaults to the piece's own, so a piece read from a source that records one
+        (a precomputed volume's ``info["type"]``) needs nothing said. Where neither says it
+        is **required** rather than guessed: a uint8 label array is indistinguishable from
+        an image by dtype, and neuroglancer's own guess reads it as one — averaging label
+        ids on downsample and losing the colour hashing and the selection UI.
 
         The conversion goes this way round, and it has to: ``Piece`` lives in neu-lib, the
         bottom tier, and a ``Piece.as_layer`` would mean the vocabulary package naming a
         viewer type three tiers above it. neu-glance reading a neu-lib type is the allowed
         direction.
         """
+        kind = kind or getattr(piece, "kind", None)
+        if kind is None:
+            raise ServeProblem(
+                f"this source records no image/segmentation type, so kind= is required — "
+                f"one of {', '.join(KINDS)}. It is not inferred from the dtype: "
+                f"neuroglancer's own guess reads a uint8 label array as an image, which "
+                f"averages label ids on downsample and loses the colour hashing and the "
+                f"selection UI. (A precomputed volume records the type in its `info`, and "
+                f"then this is not needed.)")
         return cls(array=piece.array, kind=kind,
                    name=name or getattr(piece, "name", None), frame=piece.frame,
                    **kwargs)
@@ -214,30 +248,8 @@ class ServedLayer:
         container. Only a **leading slash** makes it a dataset, so a scheme's own colon
         (``s3://…``) is left alone.
         """
-        path, _, dataset = src.partition(":")
-        if not dataset.startswith("/"):
-            path, dataset = src, ""
-        return cls._from_read(
-            _read_source(path, dataset or None, None, level=level, crop=crop,
-                         voxel_size=voxel_size),
-            path=path, kind=kind, name=name, **kwargs)
-
-    @classmethod
-    def _from_read(cls, read: dict, *, path: str, kind: str | None,
-                   name: str | None, **kwargs) -> "ServedLayer":
-        """Assemble a layer from :func:`_read_source`'s result. Shared by the three above."""
-        kind = kind or read["kind"]
-        if kind is None:
-            raise ServeProblem(
-                f"{path} records no image/segmentation type, so kind= is required — one of "
-                f"{', '.join(KINDS)}. It is not inferred from the dtype: neuroglancer's own "
-                f"guess reads a uint8 label array as an image, which averages label ids on "
-                f"downsample and loses the colour hashing and the selection UI. (A "
-                f"precomputed volume records the type in its `info`, and then this is not "
-                f"needed.)")
-        return cls(array=read["array"], kind=kind,
-                   name=name or _default_name(path, read["dataset"]),
-                   frame=read["frame"], channel_axis=read["channel_axis"], **kwargs)
+        return cls._read(src, kind, name, path=src, level=level, crop=crop,
+                         voxel_size=voxel_size, **kwargs)
 
     # ------------------------------------------------------------ where it is
     @property
@@ -254,7 +266,7 @@ class ServedLayer:
             raise ServeProblem(
                 f"layer {self.name!r} has no frame, so it has no position to report. "
                 f"Build it with a voxel_size= or from a source that records one")
-        return Piece(array=self.array, frame=self.frame)
+        return Piece(array=self.array, frame=self.frame, kind=self.kind)
 
     @property
     def bbox(self) -> Any:
@@ -288,197 +300,6 @@ class ServedLayer:
                 f"{rank}-D array {tuple(self.array.shape)}, which has "
                 f"{'a' if derived else 'no'} leading channel axis. Leave it out — the rank "
                 f"decides it")
-
-
-def _crop_request(crop: Any, what: str = "crop"):
-    """``(voxel_box, nm_bounds)`` — exactly one of them, or both ``None``.
-
-    Three ways to say which box you want, because there are three things a caller has in
-    hand:
-
-    * ``((z0,y0,x0), (z1,y1,x1))`` or the flat ``(z0,…,x1)``, in **whole voxels of the
-      level being read** — the direct form, and what the CLI takes;
-    * anything carrying ``bounds_nm`` — a :class:`neu_lib.Piece`, or another
-      :class:`ServedLayer` — meaning *the same physical box as that*. This is the one that
-      answers "show me the image under this ground-truth crop", and it is why
-      nanometres exist as the shared model space: the two frames have different voxel
-      sizes and different origins, so no voxel box is transferable between them.
-    * a ``{"nm": (lo, hi)}`` mapping, for a physical box with nothing to carry it.
-
-    Voxels are resolved here; nanometres cannot be, because converting them needs the
-    target level's own voxel size and origin, which are not known until it is opened.
-    """
-    if crop is None:
-        return None, None
-    bounds = getattr(crop, "bounds_nm", None)
-    if bounds is not None:
-        return None, tuple(bounds)
-    if isinstance(crop, Mapping):
-        if "nm" not in crop:
-            raise ServeProblem(f"{what} mapping must carry 'nm': (lo, hi); got {crop!r}")
-        return None, tuple(crop["nm"])
-    flat = tuple(crop)
-    if len(flat) == 6 and all(np.isscalar(v) or isinstance(v, (int, float))
-                             for v in flat):
-        lo, hi = tuple(int(v) for v in flat[:3]), tuple(int(v) for v in flat[3:])
-    elif len(flat) == 2:
-        lo, hi = tuple(int(v) for v in flat[0]), tuple(int(v) for v in flat[1])
-    else:
-        raise ServeProblem(
-            f"{what} must be ((z0,y0,x0), (z1,y1,x1)) or (z0,y0,x0,z1,y1,x1) in whole "
-            f"VOXELS of the level being read, a Piece/ServedLayer to take the same "
-            f"physical box as, or {{'nm': (lo, hi)}} — got {crop!r}")
-    if len(lo) != 3 or len(hi) != 3:
-        raise ServeProblem(f"{what} corners are zyx, so 3 values each; got {lo} / {hi}")
-    return (lo, hi), None
-
-
-def _read_source(path: str, dataset: str | None, fmt: str | None, *, level: int,
-                 crop: Any, voxel_size: Any, backend: Any = None) -> dict:
-    """Read one source and everything known about it. The shared half of the constructors.
-
-    Returns ``{array, frame, channel_axis, kind, dataset, format}`` — ``kind`` being
-    whatever the source *records*, or ``None`` when it records nothing and the caller has
-    to say. A precomputed volume records it in ``info["type"]`` and OME in the multiscales
-    ``type``, which is authoritative and must never be second-guessed: getting it wrong
-    averages label ids into ids that were never in the data. An HDF5 file has nowhere
-    agreed-on to say, so it records nothing.
-
-    ``backend`` short-circuits the opening for a caller that already has one; its
-    ``to_spec()`` still supplies the metadata, so the frame is read the same way either
-    way and the axis-order rule stays in one place.
-
-    The frame travels with the array, and a crop shifts its origin — which is what keeps a
-    served box on top of the volume it came from rather than at nm zero (invariant 1).
-
-    Every store read here is wrapped in ``neu_vol.logs.quiet_reads``. These constructors
-    are called straight from a notebook, so from the caller's point of view they *are* the
-    entry point and there is no ``main()`` to wrap — and an S3 open logs two
-    ``AuthCredentialsProvider`` lines at ``E`` severity per prefix that are **not**
-    failures, only the two providers that missed before the environment one succeeded.
-    """
-    from neu_lib import Frame
-    from neu_vol import describe, open_backend
-    from neu_vol.logs import quiet_reads
-    from neu_vol.source_metadata import (level_spec, location_spec,
-                                         read_level_voxel_sizes, read_source_metadata,
-                                         require_one_array)
-
-    crop, crop_nm = _crop_request(crop)
-    with quiet_reads():
-        if backend is not None:
-            spec = dict(backend.to_spec())
-            fmt = fmt or spec.get("backend")
-            dataset = spec.get("dataset") or dataset
-            meta = read_source_metadata(spec) or {}
-        elif fmt is None:
-            described = describe(path, dataset=dataset or None)
-            if described["shape"] is None:
-                require_one_array(described, path, "neu-glance serve")
-            fmt = described["format"]
-            spec = described["spec"]
-            meta = described["meta"] or {}
-            dataset = described.get("dataset") or dataset
-        else:
-            # A format named outright, for a file whose name detection would not recognise.
-            spec = location_spec(path, fmt, dataset=dataset or None)
-            meta = read_source_metadata(spec) or {}
-            dataset = spec.get("dataset") or dataset
-
-        single = fmt in ("hdf5", "image_stack")
-        if level and single:
-            raise ServeProblem(
-                f"level {level} needs a multiscale volume; {path} is {fmt}, a single array")
-
-        # **A zarr OME group is not an array**, so level 0 must go through the metadata's
-        # own `data_spec` (which names the level's subdirectory) rather than the group
-        # path. Addressing the path directly failed to open at all — the same trap
-        # `ops/pack.py` documents, and it hid because precomputed selects a scale with
-        # `scale_index` on one path and so worked fine.
-        if backend is not None:
-            read_spec = spec
-        elif single:
-            read_spec = spec
-        elif level:
-            read_spec = level_spec(path, fmt, level, dataset=dataset or None)
-        elif meta.get("data_spec"):
-            read_spec = meta["data_spec"]
-        else:
-            read_spec = spec          # a bare array: it has no levels to descend into
-        backend = backend or open_backend(read_spec)
-        shape = tuple(int(s) for s in backend.shape)
-        per_level = read_level_voxel_sizes(spec) or []
-        voxel = (tuple(voxel_size) if voxel_size
-                 else (tuple(per_level[level]) if level < len(per_level) else None)
-                 or (tuple(meta["voxel_size"]) if meta.get("voxel_size") else None))
-        if voxel is None:
-            raise ServeProblem(
-                f"{path} records no voxel size, so nothing here knows its physical "
-                f"scale; pass voxel_size=(z, y, x)")
-
-        channel_axis = len(shape) == 4
-        spatial = shape[1:] if channel_axis else shape
-        recorded = (tuple(float(o) for o in meta["offset"])
-                    if meta.get("offset") else (0.0, 0.0, 0.0))
-        if crop_nm is not None:
-            # A physical box, into THIS level's voxels — which needs the level's own voxel
-            # size and origin, and so cannot be done before it is opened. Grown outward, so
-            # the read contains the box asked for rather than dropping a face when the
-            # levels do not divide evenly.
-            box = Frame(voxel_size_nm=voxel, origin_nm=recorded).voxel_box(crop_nm)
-            crop = (tuple(max(0, v) for v in box.lo),
-                    tuple(min(e, v) for v, e in zip(box.hi, spatial)))
-            logger.info("crop %s nm -> level-%d voxels %s:%s", crop_nm, level, *crop)
-            if any(b <= a for a, b in zip(*crop)):
-                raise ServeProblem(
-                    f"the physical box {crop_nm} nm does not overlap {path}'s level-{level} "
-                    f"extent {spatial} at {voxel} nm/voxel starting {recorded} nm. If the "
-                    f"box came from another dataset's crop, the two are not the same "
-                    f"volume")
-            # **A clamp that removes most of the box means the wrong volume**, not an edge
-            # case. Taking a physical box off one dataset's crop and reading it out of
-            # another's image is the easy mistake — the numbers are plausible, the read
-            # succeeds, and what comes back is a thin slab nobody asked for. So say it, with
-            # the fraction, rather than logging the conversion and moving on.
-            asked = math.prod(b - a for a, b in zip(box.lo, box.hi))
-            got = math.prod(b - a for a, b in zip(*crop))
-            if got < asked:
-                clipped = [f"{'zyx'[a]} {box.lo[a]}:{box.hi[a]} -> {crop[0][a]}:{crop[1][a]}"
-                           for a in range(3) if (box.lo[a], box.hi[a]) != (crop[0][a],
-                                                                          crop[1][a])]
-                warn = logger.warning if got * 2 < asked else logger.info
-                warn("the physical box does not fit %s's level-%d extent %s and was "
-                     "clipped to %.0f%% of it (%s)%s", path, level, spatial,
-                     100.0 * got / asked, "; ".join(clipped),
-                     ". Losing most of a box usually means it came from a different "
-                     "dataset than this volume" if got * 2 < asked else "")
-        lo = (0, 0, 0)
-        if crop:
-            lo, hi = crop
-            for axis, (start, stop, extent) in enumerate(zip(lo, hi, spatial)):
-                if not 0 <= start < stop <= extent:
-                    nm = " — a crop in NANOMETRES looks like this" if any(
-                        v > e * 4 for v, e in zip(hi, spatial)) else ""
-                    raise ServeProblem(
-                        f"crop {lo}:{hi} does not fit {path}'s level-{level} extent "
-                        f"{spatial} on axis {axis}. The box is in whole VOXELS of that "
-                        f"level, zyx, half-open{nm}")
-            region = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
-        else:
-            region = tuple(slice(0, int(s)) for s in spatial)
-        if channel_axis:
-            region = (slice(0, shape[0]),) + region
-
-        # A crop out of something that already knows where it belongs lands at the SUM,
-        # the same rule `neu-vol to-hdf5 --crop-bbox` follows.
-        origin = tuple(o + i * v for o, i, v in zip(recorded, lo, voxel))
-
-        return {"array": backend.read_region(region),
-                "frame": Frame(voxel_size_nm=voxel, origin_nm=origin),
-                "channel_axis": channel_axis,
-                "kind": meta.get("kind"),
-                "dataset": dataset,
-                "format": fmt}
 
 
 def _default_name(path: str, dataset: str | None) -> str:
