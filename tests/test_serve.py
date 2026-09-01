@@ -115,10 +115,130 @@ def test_the_probability_shader_discards_below_rather_than_keeping_above():
     """NaN fails every comparison, so `discard if v < t` leaves an unscored voxel visible
     at every threshold while the inverted form would hide it at all of them. A model that
     declined to predict somewhere writes NaN there."""
-    from neu_glance.shaders import COLORMAP_SHADER
+    from neu_glance.shaders import COLORMAP_SHADER, PROBABILITY_SHADER
 
-    assert "if (v < threshold) discard;" in COLORMAP_SHADER
-    assert ">= threshold" not in COLORMAP_SHADER
+    for source in (PROBABILITY_SHADER, COLORMAP_SHADER):
+        assert "if (v < threshold) discard;" in source
+        assert ">= threshold" not in source
+
+
+def test_a_probability_map_is_one_colour_with_the_value_as_OPACITY():
+    """So it composites over the EM under it: unsure voxels leave the image visible and
+    confident ones cover it. A gradient at full alpha hides the image everywhere and spends
+    the colour axis on what the alpha already says."""
+    from neu_glance.shaders import PROBABILITY_SHADER, image_shader
+
+    assert image_shader(None, kind="probability") == PROBABILITY_SHADER
+    assert 'color(default="#ff0000")' in PROBABILITY_SHADER, "red by default"
+    assert "emitRGBA(vec4(color, a));" in PROBABILITY_SHADER, "value -> alpha, not -> hue"
+    # NaN needs saying twice once the alpha comes from the value: clamp(NaN) is not defined
+    # to give anything in particular, so the voxel the threshold deliberately KEPT could
+    # still be drawn invisible.
+    assert "(v != v) ? 1.0" in PROBABILITY_SHADER
+    # and the gradient is still there for anyone who wants it
+    assert "low_color" in image_shader("colormap")
+
+
+def test_the_layer_color_is_set_as_a_shader_control(frame, stop_server):
+    """In the STATE, not by generating a shader with a different default — so every layer
+    carries the same code and the viewer's panel shows the value that was set."""
+    prob = _labels(dtype="float32")
+    server = serve([ServedLayer(prob, kind="probability", name="a", frame=frame,
+                                color="#00ff00")])
+    server.add_layer(ServedLayer(prob, kind="probability", name="b", frame=frame),
+                     color=(0, 0, 255))
+
+    by_name = {lyr["name"]: lyr for lyr in server.state()["layers"]}
+    assert by_name["a"]["shaderControls"] == {"color": "#00ff00"}
+    assert by_name["b"]["shaderControls"] == {"color": "#0000ff"}, "ints read as 0..255"
+    assert by_name["a"]["shader"] == by_name["b"]["shader"], "one shader, two controls"
+
+
+def test_add_layer_color_does_not_mutate_the_layer_it_was_given(frame, stop_server):
+    """Two colours off one ServedLayer is the ordinary way to do a before/after."""
+    layer = ServedLayer(_labels(dtype="float32"), kind="probability", frame=frame)
+    server = serve([ServedLayer(_labels(), name="em", frame=frame)])
+    server.add_layer(layer, name="red")
+    server.add_layer(layer, name="green", color="#00ff00")
+
+    by_name = {lyr["name"]: lyr for lyr in server.state()["layers"]}
+    assert layer.color is None, "the caller's object is untouched"
+    assert not by_name["red"].get("shaderControls")
+    assert by_name["green"]["shaderControls"] == {"color": "#00ff00"}
+
+
+def test_a_color_the_shader_cannot_take_is_refused_not_ignored(frame, stop_server):
+    """A shaderControl neuroglancer does not recognise is ignored in silence, which reads
+    as the argument having done nothing for no reason."""
+    from neu_glance.shaders import ShaderProblem
+
+    server = serve([ServedLayer(_labels(), name="em", frame=frame)])
+    with pytest.raises(ShaderProblem, match="no single colour"):
+        server.add_layer(ServedLayer(_labels(), kind="image", name="grey", frame=frame),
+                         color="#00ff00")
+    with pytest.raises(ShaderProblem, match="it has three"):
+        server.add_layer(ServedLayer(np.zeros((3, 4, 8, 8), "float32"), kind="probability",
+                                     name="rgb", frame=frame), color="#00ff00")
+    with pytest.raises(ShaderProblem, match="label hashing"):
+        server.add_layer(ServedLayer(_labels(dtype="uint64"), kind="segmentation",
+                                     name="seg", frame=frame), color="#00ff00")
+
+
+def test_colors_are_accepted_in_the_forms_a_caller_has():
+    from neu_glance.shaders import ShaderProblem, as_hex_color
+
+    assert as_hex_color("#FF0000") == "#ff0000"
+    assert as_hex_color("ff0000") == "#ff0000"
+    assert as_hex_color("red") == "#ff0000", "a name, with nothing installed"
+    assert as_hex_color("Cyan") == "#00ffff", "case-insensitive"
+    assert as_hex_color((1.0, 0.5, 0.0)) == "#ff8000", "floats as 0..1"
+    assert as_hex_color((255, 128, 0)) == "#ff8000", "ints as 0..255"
+    assert as_hex_color((1, 1, 1)) == "#ffffff", \
+        "all <= 1 reads as floats, so this is white — the reading that cannot look like a bug"
+    for bad in ("reddish", (1.0, 0.5), 7):
+        with pytest.raises(ShaderProblem):
+            as_hex_color(bad)
+    with pytest.raises(ShaderProblem, match="alpha is not settable"):
+        as_hex_color((1.0, 0.0, 0.0, 0.5))
+
+
+def test_the_builtin_color_names_agree_with_matplotlib():
+    """What makes a PARTIAL table safe: installing matplotlib later cannot change what one
+    of these names means. Without this, `orange` could be one thing in a bare install and
+    another in a full one, and the viewer would just come up slightly wrong."""
+    to_hex = pytest.importorskip("matplotlib.colors").to_hex
+    from neu_glance.shaders import BUILTIN_COLORS
+
+    assert {name: to_hex(name) for name in BUILTIN_COLORS} == BUILTIN_COLORS
+    # single letters are matplotlib's idiom, not CSS's, and its 'c' is not 'cyan' — so they
+    # are deliberately NOT in the table, and mean matplotlib's colour when it is installed
+    assert not any(len(name) == 1 for name in BUILTIN_COLORS)
+    assert to_hex("c") != BUILTIN_COLORS["cyan"], "which is exactly why"
+
+
+def test_the_long_tail_of_names_needs_matplotlib_and_says_so(monkeypatch):
+    """matplotlib is not a dependency, so a name outside the table is a clear error in a
+    bare install rather than an ImportError from inside a colour helper."""
+    import builtins
+
+    from neu_glance.shaders import BUILTIN_COLORS, ShaderProblem, as_hex_color
+
+    assert as_hex_color("forestgreen") == "#228b22", "when matplotlib is installed"
+
+    real_import = builtins.__import__
+
+    def no_matplotlib(name, *args, **kwargs):
+        if name.startswith("matplotlib"):
+            raise ImportError("no matplotlib")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_matplotlib)
+    with pytest.raises(ShaderProblem, match="not a dependency of this package"):
+        as_hex_color("forestgreen")
+    # ...while hex and the built-in names carry on regardless, which is the point of both
+    assert as_hex_color("#ff0000") == "#ff0000"
+    assert as_hex_color("orange") == BUILTIN_COLORS["orange"]
+    assert as_hex_color((0, 255, 0)) == "#00ff00"
 
 
 def test_annotation_and_image_shaders_stay_separate_registries():
@@ -135,6 +255,8 @@ def test_annotation_and_image_shaders_stay_separate_registries():
 # the rest needs neuroglancer
 # --------------------------------------------------------------------------- #
 ng = pytest.importorskip("neuroglancer", reason="the serve extra is not installed")
+
+from neu_lib import BBox  # noqa: E402
 
 from neu_glance.serving import (ServedLayer, ServeProblem,  # noqa: E402
                                 _coordinate_space, _volume_type, _voxel_offset, serve)
@@ -273,16 +395,92 @@ def test_the_annotation_layer_is_OPT_IN(frame, stop_server):
     """A viewer that opens with a layer nobody asked for reads as a bug, and the read-back
     loop is a deliberate workflow rather than something every look at a crop wants."""
     plain = serve([ServedLayer(_labels(), name="b", frame=frame)])
-    assert not any(lyr["name"] == "regions" for lyr in plain.state()["layers"])
+    assert not any(lyr["name"] == "annotations" for lyr in plain.state()["layers"])
     with pytest.raises(ServeProblem, match="no annotation layer"):
         plain.boxes()
 
-    asked = serve([ServedLayer(_labels(), name="a", frame=frame)], regions=True)
-    assert any(lyr["name"] == "regions" for lyr in asked.state()["layers"])
+    asked = serve([ServedLayer(_labels(), name="a", frame=frame)], annotations=True)
+    assert any(lyr["name"] == "annotations" for lyr in asked.state()["layers"])
     assert asked.boxes() == [], "empty, but present and readable"
 
-    named = serve([ServedLayer(_labels(), name="c", frame=frame)], regions="picks")
+    named = serve([ServedLayer(_labels(), name="c", frame=frame)], annotations="picks")
     assert any(lyr["name"] == "picks" for lyr in named.state()["layers"])
+
+
+def test_annotate_adds_the_layer_boxes_reads_and_arms_a_tool(frame, stop_server):
+    """The other end of the read-back loop, for a viewer already up: the browser follows
+    the state, so a layer can be added after the arrays are being served."""
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)])
+    with pytest.raises(ServeProblem, match="no annotation layer"):
+        server.boxes()
+
+    assert server.annotate() == "annotations"
+    layer = server.viewer.state.layers["annotations"].layer
+    assert layer.to_json()["type"] == "annotation"
+    assert layer.tool.to_json()["type"] == "annotateBoundingBox"
+    assert server.boxes() == [], "present and readable with no layer= argument"
+
+    # The armed tool applies to the ACTIVE layer, so selecting it is what makes a click
+    # place anything — without it the tool is set and the viewer looks broken.
+    assert server.viewer.state.selected_layer.layer == "annotations"
+    assert server.viewer.state.selected_layer.visible is True
+
+
+def test_annotate_takes_the_viewers_own_dimensions(frame, stop_server):
+    """An annotation layer records its own coordinate space, and one disagreeing with the
+    viewer's loads cleanly and reads back coordinates that are simply wrong."""
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)])
+    server.annotate()
+    source = server.viewer.state.layers["annotations"].layer.to_json()["source"]
+    dims = (source[0] if isinstance(source, list) else source)
+    dims = dims["transform"]["outputDimensions"]
+    assert {k: float(v[0]) for k, v in dims.items()} == pytest.approx(
+        {"z": 40e-9, "y": 8e-9, "x": 8e-9})
+
+
+def test_annotate_again_KEEPS_what_was_already_drawn(frame, stop_server):
+    """Re-running a cell is the ordinary way this gets called twice, and emptying the layer
+    would discard exactly the work it exists to collect."""
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)], annotations=True)
+    with server.viewer.txn() as s:
+        s.layers["annotations"].annotations = [
+            ng.PointAnnotation(id="1", point=[4, 5, 6]),
+        ]
+
+    assert server.annotate(tool="point") == "annotations", "the layer already read back"
+    assert server.points() == [(4, 5, 6)], "not replaced"
+    assert (server.viewer.state.layers["annotations"].layer.tool.to_json()["type"]
+            == "annotatePoint"), "re-armed on the layer that was there"
+
+
+def test_annotate_will_not_replace_a_volume_layer(frame, stop_server):
+    """That one would take real data with it."""
+    server = serve([ServedLayer(_labels(), kind="segmentation", name="seg", frame=frame)])
+    with pytest.raises(ServeProblem, match="already a segmentation layer"):
+        server.annotate("seg")
+    assert server.selected_segments() == set(), "the volume layer is untouched"
+
+
+def test_annotate_refuses_a_tool_nothing_can_read_back(frame, stop_server):
+    """neuroglancer places lines and ellipsoids too, and boxes()/points() skip both — so
+    arming one would be drawing that never comes back, with nothing to say why."""
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)])
+    with pytest.raises(ServeProblem, match="tool must be one of box, point"):
+        server.annotate(tool="line")
+    assert "annotations" not in [lyr.name for lyr in server.viewer.state.layers], \
+        "refused before the layer is added, not half-way through"
+
+
+def test_annotate_names_the_layer_boxes_then_defaults_to(frame, stop_server):
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)])
+    assert server.annotate("picks") == "picks"
+    assert server.boxes() == [], "picks is now the default"
+    with server.viewer.txn() as s:
+        s.layers["picks"].annotations = [
+            ng.AxisAlignedBoundingBoxAnnotation(id="1", point_a=[9, 8, 7],
+                                                point_b=[1, 2, 3]),
+        ]
+    assert server.boxes() == [((1, 2, 3), (9, 8, 7))]
 
 
 def test_nothing_to_serve_is_an_error(stop_server):
@@ -290,13 +488,383 @@ def test_nothing_to_serve_is_an_error(stop_server):
         serve([])
 
 
+# --- add_layer: one more array, into a viewer already open ------------------ #
+def test_add_layer_hosts_another_array_live(frame, stop_server):
+    """The volume counterpart of annotate(): the browser follows the state, so an array
+    becomes a layer in the tab already open, with no new URL."""
+    server = serve([ServedLayer(_labels(), kind="image", name="em", frame=frame)])
+    url = server.url
+
+    assert server.add_layer(
+        ServedLayer(_labels(dtype="uint64"), kind="segmentation", name="seg",
+                    frame=frame)) is server, "the server comes back, so calls chain"
+    assert server.url == url, "the same viewer, not a new one"
+    assert [lyr["name"] for lyr in server.state()["layers"]] == ["em", "seg"]
+    assert sorted(server.volumes) == ["em", "seg"], "and it is a served volume"
+    assert server.selected_segments() == set(), "so the read-back methods find it"
+
+
+def test_add_layer_goes_through_the_SAME_builder_as_serve(frame, stop_server):
+    """Two ways of building a layer is how the volume type, the shader and the voxel offset
+    drift apart — and every one of those fails by rendering something plausible."""
+    layer = ServedLayer(_labels(dtype="uint8"), kind="segmentation", name="seg",
+                        frame=frame)
+    at_serve = serve([layer]).state()["layers"][0]
+
+    added = serve([ServedLayer(_labels(), kind="image", name="em", frame=frame)])
+    added.add_layer(layer)
+    later = [lyr for lyr in added.state()["layers"] if lyr["name"] == "seg"][0]
+
+    assert later["type"] == at_serve["type"] == "segmentation", \
+        "a uint8 label array, which neuroglancer would otherwise guess is an image"
+    assert added.volumes["seg"].volume_type == "segmentation"
+    assert added.volumes["seg"].voxel_offset.tolist() == [10, 20, 30], "the frame's origin"
+
+
+def test_add_layer_renames_a_collision_rather_than_replacing(frame, stop_server):
+    """neuroglancer keys a layer by name, so two sharing one is a collision — the same rule
+    serve follows, and now the same code.
+
+    The rename is read back off the viewer rather than off the return, which is the one
+    thing chaining costs: `add_layer` hands back the server, so the resolved name — the
+    only place the `_1` appears — has to be found in `volumes` (insertion-ordered, newest
+    last) or in the state.
+    """
+    server = serve([ServedLayer(_labels(), name="dup", frame=frame)])
+    server.add_layer(ServedLayer(_labels(), name="dup", frame=frame))
+
+    assert sorted(server.volumes) == ["dup", "dup_1"]
+    assert list(server.volumes)[-1] == "dup_1", "and the newest is the renamed one"
+    assert [lyr["name"] for lyr in server.state()["layers"]] == ["dup", "dup_1"]
+
+
+def test_add_layer_does_not_move_the_view(frame, stop_server):
+    """The rule `into` follows: adding a layer must not change where somebody is looking."""
+    from neu_lib import Frame
+
+    server = serve([ServedLayer(_labels(), name="em", frame=frame)])
+    before = (server.position, server.viewer.state.cross_section_scale)
+
+    far = Frame(voxel_size_nm=(40.0, 8.0, 8.0), origin_nm=(40000.0, 8000.0, 8000.0))
+    server.add_layer(ServedLayer(_labels(), name="elsewhere", frame=far))
+    assert (server.position, server.viewer.state.cross_section_scale) == before
+    assert server.bounds("elsewhere").lo == (1000, 1000, 1000), \
+        "it is off screen, and bounds() is how you find it"
+
+
+def test_add_layer_takes_the_dict_form(frame, stop_server):
+    server = serve([ServedLayer(_labels(), name="em", frame=frame)])
+    assert server.add_layer({"array": _labels(), "kind": "segmentation",
+                             "name": "seg", "frame": frame}) is server
+    assert server.volumes["seg"].volume_type == "segmentation", "built from the dict"
+
+
+def test_a_piece_is_a_layer_input_everywhere(frame, stop_server):
+    """`serve` and `add_layer` take the same three things, which is why one function
+    coerces for both: they had drifted, and a Piece handed to `serve` got as far as
+    `layer.shader` before failing, since a Piece answers array, kind, frame and
+    channel_axis."""
+    from neu_lib import Piece
+
+    em = Piece(array=_labels(), frame=frame, kind="image", name="em")
+    seg = Piece(array=_labels(dtype="uint64"), frame=frame, kind="segmentation", name="seg")
+
+    server = serve([em]).add_layer(seg)
+
+    assert [lyr["name"] for lyr in server.state()["layers"]] == ["em", "seg"], \
+        "named after the pieces, which is what `read_piece` puts there"
+    assert server.volumes["seg"].volume_type == "segmentation", "and the kind travelled"
+    assert server.volumes["em"].volume_type == "image"
+
+
+def test_a_piece_layer_still_honours_an_explicit_name(frame, stop_server):
+    from neu_lib import Piece
+
+    server = serve([ServedLayer(_labels(), name="em", frame=frame)])
+    server.add_layer(Piece(array=_labels(), frame=frame, kind="image", name="ignored"),
+                     name="mine")
+    assert "mine" in server.volumes and "ignored" not in server.volumes
+
+
+def test_a_piece_with_no_kind_says_what_to_do(frame, stop_server):
+    """The one thing the convenience cannot carry: there is no kind= to pass it to."""
+    from neu_lib import Piece
+
+    server = serve([ServedLayer(_labels(), name="em", frame=frame)])
+    with pytest.raises(ServeProblem, match="kind= is required"):
+        server.add_layer(Piece(array=_labels(), frame=frame))
+
+
+def test_anything_else_is_refused_by_the_one_coercion(frame, stop_server):
+    server = serve([ServedLayer(_labels(), name="em", frame=frame)])
+    with pytest.raises(ServeProblem, match="a ServedLayer, a neu_lib.Piece"):
+        server.add_layer(_labels())
+    with pytest.raises(ServeProblem, match="a ServedLayer, a neu_lib.Piece"):
+        serve([_labels()])
+
+
+def test_add_layers_chain(frame, stop_server):
+    """What returning the server is FOR: several arrays into one viewer in one expression."""
+    server = (serve([ServedLayer(_labels(), kind="image", name="em", frame=frame)])
+              .add_layer(ServedLayer(_labels(dtype="uint64"), kind="segmentation",
+                                     name="seg", frame=frame))
+              .add_layer(ServedLayer(_labels(dtype="float32"), kind="probability",
+                                     name="pred", frame=frame)))
+
+    assert [lyr["name"] for lyr in server.state()["layers"]] == ["em", "seg", "pred"]
+    assert sorted(server.volumes) == ["em", "pred", "seg"]
+
+
+# --- enclose: points -> a real box ------------------------------------------ #
+def _drawn(server, *annotations, layer="annotations"):
+    with server.viewer.txn() as s:
+        s.layers[layer].annotations = list(annotations)
+    return server
+
+
+def _annotations(server, layer="annotations"):
+    return server.viewer.state.layers[layer].layer.annotations
+
+
+def test_enclose_bounds_the_points_and_draws_the_box(frame, stop_server):
+    """Dragging a box to exact corners in neuroglancer is fiddly; clicking a point at each
+    corner is not. This is the conversion."""
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)], annotations=True)
+    _drawn(server,
+           ng.PointAnnotation(id="a", point=[10, 20, 30]),
+           ng.PointAnnotation(id="b", point=[14, 25, 40]))
+
+    assert server.enclose() == BBox((10, 20, 30), (15, 26, 41)), \
+        "half-open, so the far point's own voxel is inside"
+    assert tuple(server.enclose(replace=True)) == ((10, 20, 30), (15, 26, 41)), \
+        "and it unpacks like the (lo, hi) pair it is"
+    assert server.boxes() == [((10, 20, 30), (15, 26, 41))], "it is in the layer"
+
+
+def test_enclose_leaves_the_points_alone_by_default(frame, stop_server):
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)], annotations=True)
+    _drawn(server, ng.PointAnnotation(id="a", point=[10, 20, 30]),
+           ng.PointAnnotation(id="b", point=[14, 25, 40]))
+    server.enclose()
+    assert len(_annotations(server)) == 3
+
+
+def test_a_POSITION_and_a_FACE_are_not_rounded_the_same(frame, stop_server):
+    """The one-voxel distinction the whole method turns on. A point sits *inside* a voxel,
+    so the box containing it runs to floor+1. A box corner is a *boundary* between voxels,
+    so it rounds out to that boundary and no further — otherwise enclosing a box would grow
+    it by a voxel every call and the round trip would never settle."""
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)], annotations=True)
+
+    _drawn(server, ng.PointAnnotation(id="a", point=[10, 20, 30]))
+    assert server.enclose(replace=True) == BBox((10, 20, 30), (11, 21, 31)), "a position"
+
+    _drawn(server, ng.AxisAlignedBoundingBoxAnnotation(
+        id="b", point_a=[10, 20, 30], point_b=[11, 21, 31]))
+    assert server.enclose(replace=True) == BBox((10, 20, 30), (11, 21, 31)), "faces"
+    assert server.enclose(replace=True) == BBox((10, 20, 30), (11, 21, 31)), \
+        "and enclosing it again is a fixed point, not a box that creeps outward"
+
+
+def test_enclose_rounds_OUTWARD_where_boxes_rounds_to_nearest(frame, stop_server):
+    """A box that exists to contain things must not round in past the point that put it
+    there — where `points()` reports the nearest voxel to each."""
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)], annotations=True)
+    _drawn(server,
+           ng.PointAnnotation(id="a", point=[10.4, 20.9, 30.1]),
+           ng.PointAnnotation(id="b", point=[14.6, 25.2, 40.8]))
+
+    assert server.points() == [(10, 21, 30), (15, 25, 41)], "nearest, as ever"
+    assert server.enclose() == BBox((10, 20, 30), (15, 26, 41)), "outward, and contains them"
+
+
+def test_a_single_point_encloses_the_voxel_it_is_in(frame, stop_server):
+    """Whatever fraction it landed on — otherwise the box depends on where in the voxel
+    somebody happened to click."""
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)], annotations=True)
+
+    _drawn(server, ng.PointAnnotation(id="a", point=[10, 20, 30]))
+    assert server.enclose(replace=True) == BBox((10, 20, 30), (11, 21, 31))
+
+    _drawn(server, ng.PointAnnotation(id="a", point=[10.4, 20.4, 30.4]))
+    assert server.enclose(replace=True) == BBox((10, 20, 30), (11, 21, 31)), "same voxel"
+
+
+def test_enclose_takes_a_margin_per_axis_or_for_all(frame, stop_server):
+    """Per axis is what an anisotropic volume usually wants."""
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)], annotations=True)
+    _drawn(server, ng.PointAnnotation(id="a", point=[10, 20, 30]),
+           ng.PointAnnotation(id="b", point=[14, 25, 40]))
+
+    assert server.enclose(margin=2, replace=True) == BBox((8, 18, 28), (17, 28, 43))
+
+    _drawn(server, ng.PointAnnotation(id="a", point=[10, 20, 30]),
+           ng.PointAnnotation(id="b", point=[14, 25, 40]))
+    assert server.enclose(margin=(1, 4, 4)) == BBox((9, 16, 26), (16, 30, 45))
+
+    with pytest.raises(ServeProblem, match="margin has 2 axes"):
+        server.enclose(margin=(1, 2))
+
+
+def test_enclose_replace_leaves_only_the_box(frame, stop_server):
+    """The points were scaffolding — but deleting what someone drew is opt-in, because this
+    reads the viewer rather than owning it."""
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)], annotations=True)
+    _drawn(server, ng.PointAnnotation(id="a", point=[10, 20, 30]),
+           ng.PointAnnotation(id="b", point=[14, 25, 40]))
+
+    server.enclose(replace=True)
+    assert server.points() == [], "the points that went in are gone"
+    assert [a.id for a in _annotations(server)] != ["a", "b"]
+    assert len(_annotations(server)) == 1
+    assert server.boxes() == [((10, 20, 30), (15, 26, 41))]
+
+
+def test_enclose_without_replace_encloses_ITSELF_next_time(frame, stop_server):
+    """Not a bug to work around — it is what "enclose what is drawn" means, and it is the
+    reason replace=True is the usual call. Pinned so nobody quietly "fixes" it."""
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)], annotations=True)
+    _drawn(server, ng.PointAnnotation(id="a", point=[10, 20, 30]))
+
+    assert server.enclose(margin=2) == BBox((8, 18, 28), (13, 23, 33))
+    assert server.enclose(margin=2) == BBox((6, 16, 26), (15, 25, 35)), "grown by the margin"
+
+
+def test_enclose_counts_every_annotation_type(frame, stop_server):
+    """The toolbar can place lines, ellipsoids and polylines, and a box that quietly ignored
+    one would be too small with nothing to say so."""
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)], annotations=True)
+    _drawn(server,
+           ng.PointAnnotation(id="p", point=[10, 10, 10]),
+           ng.AxisAlignedBoundingBoxAnnotation(id="b", point_a=[8, 8, 8],
+                                               point_b=[12, 12, 12]),
+           ng.LineAnnotation(id="l", point_a=[5, 10, 10], point_b=[10, 10, 10]),
+           ng.EllipsoidAnnotation(id="e", center=[10, 10, 20], radii=[1, 1, 3]))
+
+    assert server.enclose() == BBox((5, 8, 8), (12, 12, 23)), \
+        "the line's low x and the ellipsoid's far z are both in"
+
+
+def test_enclose_refuses_an_annotation_it_cannot_place():
+    """Same reason: silently dropping one makes the box too small."""
+    from neu_glance.serving import _annotation_bbox
+
+    with pytest.raises(ServeProblem, match="cannot tell where a"):
+        _annotation_bbox(object())
+
+
+def test_enclose_with_nothing_drawn_says_so(frame, stop_server):
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)], annotations=True)
+    with pytest.raises(ServeProblem, match="nothing is drawn"):
+        server.enclose()
+
+    plain = serve([ServedLayer(_labels(), name="c", frame=frame)])
+    with pytest.raises(ServeProblem, match="no annotation layer"):
+        plain.enclose()
+
+
+def test_a_margin_that_collapses_an_axis_is_an_error(frame, stop_server):
+    """Rather than a box with lo >= hi, which every consumer in this suite reads as empty."""
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)], annotations=True)
+    _drawn(server, ng.PointAnnotation(id="a", point=[10, 20, 30]),
+           ng.PointAnnotation(id="b", point=[14, 25, 40]))
+
+    with pytest.raises(ServeProblem, match="leaves an empty box"):
+        server.enclose(margin=-3)
+
+
+def test_a_margin_reaching_past_the_data_warns_when_it_is_not_clipped(frame, stop_server,
+                                                                      caplog):
+    """Not clipped by default, because this reads a viewer someone is drawing in and
+    silently returning a smaller box than the one now on their screen is worse. But a
+    negative coordinate is out of bounds in any frame, so it is said."""
+    import logging
+
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)], annotations=True)
+    _drawn(server, ng.PointAnnotation(id="a", point=[2, 2, 2]))
+    with caplog.at_level(logging.WARNING, logger="neu_glance.serving"):
+        assert server.enclose(margin=5) == BBox((-3, -3, -3), (8, 8, 8))
+    assert "outside the volume" in caplog.text
+
+
+# --- clipping: the volume's extent, or where its data is -------------------- #
+def test_bounds_is_the_served_arrays_extent_offset_included(frame, stop_server):
+    """`_labels()` is (8, 16, 16) and the frame's origin is 10, 20, 30 voxels in."""
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)])
+    assert server.bounds() == BBox((10, 20, 30), (18, 36, 46))
+    assert server.bounds("b") == server.bounds(), "one layer, so the union is the same"
+    with pytest.raises(ServeProblem, match="no served layer named"):
+        server.bounds("nope")
+
+
+def test_bounds_unions_the_layers_and_converts_a_COARSER_ones_voxels(frame, stop_server):
+    """The viewer navigates in the first layer's voxels, so a second layer at twice the
+    voxel size is half as many of them — read from the volume's own recorded scales rather
+    than assumed, the same rule invariant NM-SPACE states for everything else."""
+    from neu_lib import Frame
+
+    coarse = Frame(voxel_size_nm=(80.0, 16.0, 16.0), origin_nm=(400.0, 160.0, 240.0))
+    server = serve([ServedLayer(_labels(), name="fine", frame=frame),
+                    ServedLayer(_labels((4, 8, 8)), name="coarse", frame=coarse)])
+    assert server.bounds("fine") == BBox((10, 20, 30), (18, 36, 46))
+    assert server.bounds("coarse") == BBox((10, 20, 30), (18, 36, 46)), \
+        "the same physical box, in the viewer's voxels"
+    assert server.bounds() == BBox((10, 20, 30), (18, 36, 46))
+
+
+def test_data_bounds_is_where_the_labels_are(frame, stop_server):
+    """Usually far tighter than the volume — a crop is mostly background."""
+    array = np.zeros((8, 16, 16), "uint64")
+    array[2:5, 3:9, 4:6] = 7
+    server = serve([ServedLayer(array, kind="segmentation", name="seg", frame=frame)])
+
+    assert server.bounds() == BBox((10, 20, 30), (18, 36, 46))
+    assert server.data_bounds() == BBox((12, 23, 34), (15, 29, 36)), "offset included"
+
+
+def test_data_bounds_on_an_empty_layer_says_so(frame, stop_server):
+    """Rather than an empty box, which reads downstream as a region holding no labels."""
+    server = serve([ServedLayer(np.zeros((8, 16, 16), "uint64"), kind="segmentation",
+                                name="seg", frame=frame)])
+    with pytest.raises(ServeProblem, match="entirely zero"):
+        server.data_bounds()
+
+
+def test_enclose_clips_to_the_volume_or_to_the_data(frame, stop_server):
+    """The margin reaches past the end of the array happily; this is what bounds it."""
+    array = np.zeros((8, 16, 16), "uint64")
+    array[2:5, 3:9, 4:6] = 7
+    server = serve([ServedLayer(array, kind="segmentation", name="seg", frame=frame)],
+                   annotations=True)
+    _drawn(server, ng.PointAnnotation(id="a", point=[13, 25, 35]))
+
+    assert server.enclose(margin=50) == BBox((-37, -25, -15), (64, 76, 86)), "unclipped"
+    assert server.enclose(margin=50, clip="volume") == server.bounds()
+    assert server.enclose(margin=50, clip="data") == server.data_bounds()
+    assert server.enclose(margin=50, clip=server.bounds("seg")) == server.bounds("seg"), \
+        "an explicit box, for staying inside one particular layer"
+    assert server.enclose(margin=50, clip=((0, 0, 0), (20, 30, 40))) \
+        == BBox((0, 0, 0), (20, 30, 40)), "or a plain (lo, hi) pair"
+
+
+def test_a_clip_that_leaves_nothing_is_an_error(frame, stop_server):
+    """An empty box reads downstream as a region holding no data, which is not what "your
+    margin fell off the edge" means."""
+    server = serve([ServedLayer(_labels(), name="b", frame=frame)], annotations=True)
+    _drawn(server, ng.PointAnnotation(id="a", point=[10, 20, 30]))
+    with pytest.raises(ServeProblem, match="leaves nothing"):
+        server.enclose(clip=((900, 900, 900), (999, 999, 999)))
+    with pytest.raises(ServeProblem, match="clip must be a BBox"):
+        server.enclose(clip="whatever")
+
+
 # --- reading the browser's state back -------------------------------------- #
 def test_boxes_come_back_sorted_per_axis(frame, stop_server):
     """A box drawn up-and-left has point_a greater than point_b, and every consumer of a
     box in this suite expects half-open lo < hi."""
-    server = serve([ServedLayer(_labels(), name="a", frame=frame)], regions=True)
+    server = serve([ServedLayer(_labels(), name="a", frame=frame)], annotations=True)
     with server.viewer.txn() as s:
-        s.layers["regions"].annotations = [
+        s.layers["annotations"].annotations = [
             ng.AxisAlignedBoundingBoxAnnotation(id="1", point_a=[9, 8, 7],
                                                point_b=[1, 2, 3]),
             ng.PointAnnotation(id="2", point=[4, 5, 6]),
@@ -757,12 +1325,24 @@ def test_no_frame_anywhere_leaves_neuroglancers_own_default(stop_server):
     assert "position" not in state
 
 
-def test_the_cli_regions_flag_is_opt_in():
+def test_the_cli_annotate_flag_is_opt_in():
     from neu_glance.cli import _parse_args
 
-    assert _parse_args(["serve", "--seg", "x.h5"]).regions is False
-    assert _parse_args(["serve", "--seg", "x.h5", "--regions"]).regions is True
-    assert _parse_args(["serve", "--seg", "x.h5", "--regions", "picks"]).regions == "picks"
+    assert _parse_args(["serve", "--seg", "x.h5"]).annotate is False
+    assert _parse_args(["serve", "--seg", "x.h5", "--annotate"]).annotate is True
+    assert _parse_args(["serve", "--seg", "x.h5", "--annotate", "picks"]).annotate == "picks"
+
+
+def test_the_serve_and_gen_annotation_flags_are_spelled_APART():
+    """`gen --annotations SOURCE` means "load this precomputed annotation source"; serve's
+    flag makes an empty layer to draw in. One name for both is the kind of thing nobody
+    reads the help for twice, so serve's is `--annotate`."""
+    from neu_glance.cli import _parse_args
+
+    assert _parse_args(["gen", "--annotations", "s3://my-bucket/syn"]).annotations \
+        == ["s3://my-bucket/syn"]
+    with pytest.raises(SystemExit):
+        _parse_args(["serve", "--seg", "x.h5", "--annotations", "picks"])
 
 
 def test_stop_serving_works_without_a_handle(frame, stop_server):

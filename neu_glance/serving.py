@@ -32,16 +32,22 @@ Three things about the served path that are not obvious and cost real time to re
 Interaction runs the other way too, which is the point of hosting rather than publishing:
 :meth:`Server.on_click`, :meth:`Server.boxes` and :meth:`Server.selected_segments` read
 the browser's own state back, so a region picked in the viewer is usable in the notebook.
+:meth:`Server.annotate` is the other end of that loop — it adds the layer those read from,
+to a viewer already open, since the browser follows the state rather than the other way
+round.
 """
 
 from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, Sequence
+import uuid
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Mapping, Self, Sequence
 
 import numpy as np
+
+from neu_lib import Piece
 
 logger = logging.getLogger(__name__)
 
@@ -59,13 +65,45 @@ from neu_lib import KINDS  # noqa: E402
 
 #: Name of the annotation layer :meth:`Server.boxes` reads back. **Opt-in**: a viewer that
 #: grows a layer nobody asked for is confusing, and the read-back loop is a deliberate
-#: workflow rather than something every look at a crop needs. Pass ``regions=True`` (or a
-#: name) to `serve`, or `--regions` on the command line.
-REGIONS_LAYER = "regions"
+#: workflow rather than something every look at a crop needs. Pass ``annotations=True``
+#: (or a name) to `serve`, ``--annotate`` on the command line — spelled differently there
+#: because ``gen --annotations`` already means a source to load — or
+#: :meth:`Server.annotate` once the viewer is already up.
+ANNOTATE_LAYER = "annotations"
+
+#: The annotation tools that can be armed, keyed by the read-back method that understands
+#: what they draw. **Only these two, deliberately**: neuroglancer also places lines,
+#: ellipsoids and polylines, and :meth:`Server.boxes` / :meth:`Server.points` skip every one
+#: of them — so arming one would mean drawing that never comes back, with nothing to say
+#: why.
+ANNOTATION_TOOLS = {"box": "annotateBoundingBox", "point": "annotatePoint"}
 
 
 class ServeProblem(RuntimeError):
     """The arrays or options given cannot be served as asked."""
+
+
+def _as_served_layer(layer: Any) -> ServedLayer:
+    """Whatever a caller offered as a layer, as a :class:`ServedLayer`.
+
+    **One place says what a layer input may be**, for the reason
+    :meth:`Server._add_layer_in` is one place: :func:`serve` and :meth:`Server.add_layer`
+    accepting different things is a wart you meet at the second call site, not the first.
+    They had already drifted — one coerced ``dict``, the other any ``Mapping`` — and a
+    :class:`neu_lib.Piece` handed to `serve` failed on ``layer.shader`` rather than being
+    converted, because a Piece answers ``array``, ``kind``, ``frame`` and ``channel_axis``
+    and so gets a long way in before anything notices.
+    """
+    if isinstance(layer, ServedLayer):
+        return layer
+    if isinstance(layer, Piece):
+        return ServedLayer.from_piece(layer)
+    if isinstance(layer, Mapping):
+        return ServedLayer(**layer)
+    raise ServeProblem(
+        f"a layer is a ServedLayer, a neu_lib.Piece, or the dict form of a ServedLayer — "
+        f"got {type(layer).__name__}. Build one with ServedLayer.from_array, .from_hdf5, "
+        f".from_volume, .from_piece or .from_source.")
 
 
 def _neuroglancer():
@@ -90,6 +128,16 @@ class ServedLayer:
     origin dropped here puts the crop at nm zero, which is correct for a whole volume and
     wrong for every box out of one, with nothing to show for it.
 
+    ``color`` sets the shader's colour — a name (``"red"``, ``"cyan"``, and the rest of
+    :data:`~neu_glance.shaders.BUILTIN_COLORS`), ``"#00ff00"``, ``"00ff00"``, or a
+    3-sequence of floats (0..1) or ints (0..255). Any colour matplotlib names works too
+    where matplotlib is installed, which it need not be. It applies to a shader that has a
+    single colour to set,
+    which the ``probability`` default does (red, with **opacity carrying the value**, so the
+    map composites over the EM under it). Two probability maps in one viewer in two colours
+    is what it is for. ``opacity`` is a separate thing and multiplies with it: the layer's
+    overall opacity, where the shader's alpha varies per voxel.
+
     ``channel_axis`` marks a leading channel axis (a 3-channel probability map) and is
     **derived from the array's rank** — a served volume is 3 spatial axes, so 4-D means a
     channel axis and 3-D means none, and there is no third possibility to choose between.
@@ -104,6 +152,7 @@ class ServedLayer:
     shader: str | None = None
     channel_axis: bool | None = None
     opacity: float | None = None
+    color: Any = None
 
     # ------------------------------------------------------------ constructors
     #
@@ -379,6 +428,120 @@ def _voxel_offset(frame: Any = None, *, channel_axis: bool = False,
     return ([0] + offset) if channel_axis else offset
 
 
+def _tool_type(tool: str | None) -> str | None:
+    """neuroglancer's name for an annotation tool, or ``None`` to arm nothing."""
+    if tool is None:
+        return None
+    try:
+        return ANNOTATION_TOOLS[tool]
+    except KeyError:
+        raise ServeProblem(
+            f"tool must be one of {', '.join(sorted(ANNOTATION_TOOLS))} or None, got "
+            f"{tool!r}. Only these two are offered because they are the two `boxes()` and "
+            f"`points()` can read back") from None
+
+
+def _annotation_layer(ng, dimensions: Any, tool: str | None = "box") -> Any:
+    """An empty ``local://annotations`` layer in ``dimensions``, with ``tool`` armed.
+
+    The one place such a layer is built, so ``serve(annotations=...)`` and
+    :meth:`Server.annotate` cannot end up making two different things under one name.
+
+    ``dimensions`` is the **viewer's** coordinate space, never a fresh one: an annotation
+    layer records its own, and one that disagrees with the viewer's puts every annotation
+    somewhere other than where it was drawn — which loads cleanly and reads back as
+    coordinates that are simply wrong.
+    """
+    return ng.LocalAnnotationLayer(dimensions=dimensions, tool=_tool_type(tool))
+
+
+def _faces_box(lo: Sequence[float], hi: Sequence[float]) -> Any:
+    """The whole-voxel box containing a shape given by its **faces**, outward.
+
+    For the annotations whose numbers are boundaries rather than positions — a box's two
+    corners, an ellipsoid's extent. Rounds out, and never to nothing: a shape drawn thinner
+    than a voxel still occupies the voxel it is in.
+    """
+    from neu_lib import BBox
+
+    low = [math.floor(v) for v in lo]
+    return BBox(tuple(low), tuple(max(math.ceil(h), l + 1) for h, l in zip(hi, low)))
+
+
+def _annotation_bbox(ann: Any) -> Any:
+    """The whole-voxel :class:`neu_lib.BBox` containing one annotation, whatever type.
+
+    Handles **every** neuroglancer annotation type rather than the two
+    :meth:`Server.annotate` arms, because the toolbar can place the others and an enclosing
+    box that quietly ignored one would be too small with nothing to say so. An unrecognised
+    type raises for the same reason.
+
+    **A position and a face are not rounded the same way, and conflating them is a
+    one-voxel error in whichever direction you picked.** A point sits *inside* a voxel, so
+    the box containing it is ``floor(p) .. floor(p)+1`` — which is what `BBox.from_points`
+    means by adding one, and dropping it silently loses the far face. A box's corner is a
+    *boundary* between voxels, so it rounds outward to that boundary and no further —
+    otherwise enclosing a box would grow it by a voxel on every call, and the round trip
+    through :meth:`Server.enclose` would never settle.
+    """
+    from neu_lib import BBox
+
+    point = getattr(ann, "point", None)
+    if point is not None:                                            # a point: a position
+        return BBox.from_points([[float(v) for v in point]])
+    a, b = getattr(ann, "point_a", None), getattr(ann, "point_b", None)
+    if a is not None and b is not None:
+        a = [float(v) for v in a]
+        b = [float(v) for v in b]
+        if isinstance(ann, _neuroglancer().LineAnnotation):           # two positions
+            return BBox.from_points([a, b])
+        return _faces_box([min(p, q) for p, q in zip(a, b)],          # a box: two faces
+                          [max(p, q) for p, q in zip(a, b)])
+    centre, radii = getattr(ann, "center", None), getattr(ann, "radii", None)
+    if centre is not None and radii is not None:                     # an ellipsoid: faces
+        c = [float(v) for v in centre]
+        r = [abs(float(v)) for v in radii]
+        return _faces_box([x - y for x, y in zip(c, r)], [x + y for x, y in zip(c, r)])
+    points = getattr(ann, "points", None)                            # a polyline
+    if points is not None:
+        return BBox.from_points([[float(v) for v in p] for p in points])
+    raise ServeProblem(
+        f"cannot tell where a {type(ann).__name__} is, so it cannot be enclosed — this is "
+        f"an annotation type this package does not know about")
+
+
+def _margin(margin: Any, rank: int) -> tuple[int, ...]:
+    """A per-axis margin in whole voxels, from a scalar or a zyx sequence."""
+    values = [margin] * rank if isinstance(margin, (int, float)) else list(margin)
+    if len(values) != rank:
+        raise ServeProblem(
+            f"margin has {len(values)} axes but the annotations have {rank} — pass one "
+            f"number for every axis, or a single number for all of them")
+    return tuple(int(round(float(v))) for v in values)
+
+
+def _as_bbox(box: Any, what: str) -> Any:
+    """A :class:`neu_lib.BBox` from one, or from a ``(lo, hi)`` pair."""
+    from neu_lib import BBox
+
+    if isinstance(box, BBox):
+        return box
+    try:
+        lo, hi = box
+        return BBox(tuple(lo), tuple(hi))
+    except (TypeError, ValueError) as e:
+        raise ServeProblem(f"{what} must be a BBox or a (lo, hi) pair: {e}") from None
+
+
+def _spatial_axes(dimensions: Any) -> list[int]:
+    """The indices of the navigable axes. A trailing ``^`` marks one local to a layer.
+
+    neuroglancer's own convention, so a channelled layer's ``c^`` is dropped by the same
+    rule that put it there rather than by assuming it is axis 0.
+    """
+    return [i for i, n in enumerate(dimensions.names) if not n.endswith("^")]
+
+
 def _volume_type(layer: ServedLayer) -> str:
     """``segmentation`` or ``image``, from ``kind`` alone — never from the dtype."""
     return "segmentation" if layer.kind == "segmentation" else "image"
@@ -397,6 +560,28 @@ def _shader_for(layer: ServedLayer) -> str | None:
     return image_shader(layer.shader, kind=layer.kind, channels=_channels(layer))
 
 
+def _shader_controls(layer: ServedLayer) -> dict[str, Any]:
+    """``shaderControls`` for this layer — the state overrides, not new GLSL.
+
+    Only ``color`` so far, and set in the **state** rather than by generating a shader with
+    a different default, for the reason :data:`~neu_glance.shaders.SPLIT_CONTROLS` is: every
+    layer then carries the same code, and the viewer's control panel shows the value that
+    was set rather than a shader nobody can diff against the built-in.
+    """
+    from .shaders import ShaderProblem, as_hex_color, shader_color_control
+
+    if layer.color is None:
+        return {}
+    if layer.kind == "segmentation":
+        raise ShaderProblem(
+            "color= is for an image or probability layer; a segmentation is coloured by "
+            "neuroglancer's own label hashing, which is what makes two touching bodies "
+            "distinguishable. Pick colours in the viewer's segment list instead.")
+    control = shader_color_control(layer.shader, kind=layer.kind,
+                                   channels=_channels(layer))
+    return {control: as_hex_color(layer.color, "color")}
+
+
 def _channels(layer: ServedLayer) -> int:
     return int(layer.array.shape[0]) if layer.channel_axis else 1
 
@@ -409,10 +594,10 @@ class Server:
     region out of a click. ``.viewer`` is exposed for anything not wrapped.
     """
 
-    def __init__(self, viewer, volumes: dict[str, Any], regions: str | None) -> None:
+    def __init__(self, viewer, volumes: dict[str, Any], annotations: str | None) -> None:
         self.viewer = viewer
         self.volumes = volumes
-        self._regions = regions
+        self._annotations = annotations
         self._actions = 0
 
     # -------------------------------------------------------------- addressing
@@ -436,6 +621,112 @@ class Server:
     def __repr__(self) -> str:
         return f"<Server {self.url} layers={sorted(self.volumes)}>"
 
+    # -------------------------------------------------------------- adding layers
+    def _add_layer_in(self, s: Any, layer: ServedLayer,
+                      name: str | None = None) -> tuple[str, Any]:
+        """Host one array and put its layer in an **open transaction**. Returns the name.
+
+        **The one place a served layer is set up**, called by :func:`serve` inside its
+        single transaction and by :meth:`add_layer` inside its own. Two ways of building a
+        layer is how the volume type, the shader and the voxel offset drift apart, and
+        every one of those fails by rendering something plausible.
+
+        Takes the transaction rather than opening one so `serve` stays a **single** state
+        push: a half-populated state reaching the browser is a visible flicker, and the
+        dimensions have to land with the layers that are expressed in them.
+        """
+        ng = _neuroglancer()
+        # neuroglancer keys a layer by name, so two sharing one is a collision rather than
+        # a duplicate — the same thing `merge_into` renames for. Asked of the transaction's
+        # own layers, which is what makes this correct for a viewer that already has some,
+        # whether they came from `into` or from an earlier `add_layer`.
+        base = name or layer.name or layer.kind
+        resolved, n = base, 1
+        while resolved in s.layers:
+            resolved, n = f"{base}_{n}", n + 1
+        if resolved != base:
+            logger.warning("layer name %r was taken; using %r", base, resolved)
+
+        volume = ng.LocalVolume(
+            layer.array,
+            _coordinate_space(ng, layer.frame, channel_axis=layer.channel_axis,
+                              name=resolved),
+            volume_type=_volume_type(layer),
+            voxel_offset=_voxel_offset(layer.frame, channel_axis=layer.channel_axis,
+                                       name=resolved),
+            encoding=ENCODING,
+        )
+        self.volumes[resolved] = volume
+        if layer.kind == "segmentation":
+            # `color=` is refused for a segmentation rather than ignored; asked before the
+            # layer is built so the refusal arrives instead of a viewer that came up wrong.
+            _shader_controls(layer)
+            s.layers[resolved] = ng.SegmentationLayer(source=volume)
+        else:
+            kwargs: dict[str, Any] = {"source": volume}
+            shader = _shader_for(layer)
+            if shader:
+                kwargs["shader"] = shader
+            controls = _shader_controls(layer)
+            if controls:
+                kwargs["shader_controls"] = controls
+            if layer.opacity is not None:
+                kwargs["opacity"] = float(layer.opacity)
+            s.layers[resolved] = ng.ImageLayer(**kwargs)
+        return resolved, volume
+
+    def add_layer(self, layer: Any, *, name: str | None = None,
+                  color: Any = None) -> Self:
+        """Host one more array in this viewer, live. Returns **the server**, so calls chain.
+
+        The volume counterpart of :meth:`annotate`: the browser follows the state, so an
+        array becomes a layer in the tab already open, with nothing re-served and no new
+        URL. What :func:`serve` does per layer, one at a time::
+
+            srv = (serve([em])
+                   .add_layer(ServedLayer.from_hdf5("gt.h5", "/vol_03700", "segmentation"))
+                   .add_layer(ServedLayer.from_array(pred, "probability",
+                                                     voxel_size=(40, 8, 8)),
+                              name="prediction"))
+
+        Chaining is what the return is for, and the one thing it costs is the **resolved**
+        name — which differs from the one asked for only when a collision renamed it (below).
+        It is readable off the viewer either way: ``srv.volumes`` is insertion-ordered, so
+        ``list(srv.volumes)[-1]`` is the layer just added, and ``srv.state()["layers"]``
+        names them all.
+
+        Takes a :class:`ServedLayer`, a :class:`neu_lib.Piece`, or the ``dict`` form — the
+        same three :func:`serve` takes, so every constructor and every rule about ``kind``,
+        frames and the channel axis applies unchanged. It goes through the same builder
+        `serve` does, so there is no second way for a layer to end up configured. A piece
+        arrives already named and knowing its kind (``ServedLayer.from_piece``); one whose
+        ``kind`` is ``None`` needs ``ServedLayer.from_piece(piece, kind)``, since there is
+        nothing here to pass it to.
+
+        **It does not move the view**, the rule `into` follows: adding a layer must not
+        change where somebody is looking. A layer whose data sits somewhere else will be
+        off screen, and :meth:`bounds` is how to find it.
+
+        A name already in the viewer is **renamed**, not replaced — neuroglancer keys a
+        layer by name, so two sharing one is a collision rather than a duplicate.
+
+        ``color`` overrides the layer's own, so one array can go in twice in two colours, or
+        a probability map can be recoloured without rebuilding the ServedLayer::
+
+            srv.add_layer(pred, color="#00ff00")     # green, opacity carrying the value
+        """
+        _neuroglancer()
+        layer = _as_served_layer(layer)
+        if color is not None:
+            # A copy, not a mutation: the caller may be holding that ServedLayer, and two
+            # `add_layer` calls with different colours off one layer object is the ordinary
+            # way to do a before/after.
+            layer = replace(layer, color=color)
+        with self.viewer.txn() as s:
+            resolved, _ = self._add_layer_in(s, layer, name)
+        logger.info("added layer %r to %s", resolved, self.url)
+        return self
+
     # -------------------------------------------------------------- reading back
     @property
     def position(self) -> tuple[float, ...] | None:
@@ -457,6 +748,317 @@ class Server:
             f"say which layer: this viewer has {len(names)} segmentation layers "
             f"({', '.join(sorted(names)) or 'none'})")
 
+    def annotate(self, name: str | None = None, *, tool: str | None = "box",
+                 select: bool = True) -> str:
+        """Add a layer to draw in, arm a tool, and return the layer's name.
+
+        The other half of :meth:`boxes` / :meth:`points`, for a viewer already up — the same
+        layer ``serve(annotations=True)`` would have made, without having to re-serve the arrays
+        to get one. The browser picks the change up live, so the layer appears in a viewer
+        that is already open::
+
+            srv = serve([em, gt])
+            srv.annotate()              # draw boxes; ctrl+mousedown0 places one
+            srv.boxes()                 # -> [((lo), (hi)), ...] in zyx voxels
+            srv.annotate(tool="point")  # same layer, now placing points
+            srv.points()
+
+        ``tool`` is what a click places — ``"box"``, ``"point"``, or ``None`` to arm
+        nothing and leave the viewer's own toolbar to it. Only those two, because they are
+        the two this class can read back; see :data:`ANNOTATION_TOOLS`.
+
+        ``select`` opens the layer's side panel and makes it the active layer, which is what
+        the armed tool applies to — without it the tool is set but a click does nothing
+        until the layer is picked by hand, which reads as the method having failed.
+
+        **Calling it again with the same name keeps the annotations already drawn.** It
+        re-arms the tool on the layer that is there rather than replacing it: re-running a
+        cell is the ordinary way this gets called twice, and silently emptying the layer
+        would discard exactly the work it exists to collect. A name already taken by a
+        volume layer is an error instead — that one would replace real data.
+
+        The name defaults to the layer this server already reads back, else
+        :data:`ANNOTATE_LAYER`. Whatever it ends up being becomes the default for
+        :meth:`boxes` and :meth:`points`.
+        """
+        ng = _neuroglancer()
+        # Resolved before the transaction: a bad tool must not leave a half-added layer.
+        tool_type = _tool_type(tool)
+        name = str(name) if name else (self._annotations or ANNOTATE_LAYER)
+
+        existing = (self.viewer.state.layers[name]
+                    if name in self.viewer.state.layers else None)
+        if existing is not None:
+            kind = getattr(existing.layer, "type", None)
+            if kind != "annotation":
+                raise ServeProblem(
+                    f"layer {name!r} is already {'an' if kind == 'image' else 'a'} {kind} "
+                    f"layer, and replacing it would take its data with it — pass a name "
+                    f"for the annotation layer instead, e.g. annotate({name + '_picks'!r})")
+
+        with self.viewer.txn() as s:
+            if existing is None:
+                s.layers[name] = _annotation_layer(ng, self._dimensions(), tool)
+            else:
+                s.layers[name].tool = tool_type
+            if select:
+                s.selected_layer.layer = name
+                s.selected_layer.visible = True
+
+        self._annotations = name
+        logger.info("annotation layer %r %s; tool %s", name,
+                    "reused" if existing is not None else "added", tool or "not armed")
+        return name
+
+    # -------------------------------------------------------------- extents
+    def _viewer_scales(self) -> list[float]:
+        """The viewer's own per-axis scale, in whatever unit neuroglancer normalized to.
+
+        Only ever used as a **ratio** against a layer's own scales, which come from the
+        same normalization — so the unit cancels and the nm-to-metres round trip cannot
+        introduce the drift that turns 160 nm into voxel 19.999999.
+        """
+        dims = self._dimensions()
+        return [float(dims.scales[i]) for i in _spatial_axes(dims)]
+
+    def _in_viewer_voxels(self, lo: Sequence[float], hi: Sequence[float],
+                          scales: Sequence[float]) -> Any:
+        """A box in one layer's voxels, as whole voxels of the viewer's own space.
+
+        Rounds **inward**, unlike everything else here, because the only caller is a limit
+        to clip against: a viewer voxel the layer covers half of is not a voxel the layer
+        can answer for. Exact and a no-op for the usual case, where the layer being clipped
+        to is the one whose frame the viewer took.
+        """
+        from neu_lib import BBox
+
+        ratio = [s / v for s, v in zip(scales, self._viewer_scales())]
+        return BBox(tuple(math.ceil(a * r) for a, r in zip(lo, ratio)),
+                    tuple(math.floor(b * r) for b, r in zip(hi, ratio)))
+
+    def _served(self, layer: str | None) -> list[str]:
+        if layer is None:
+            return sorted(self.volumes)
+        if layer not in self.volumes:
+            raise ServeProblem(
+                f"no served layer named {layer!r} — this viewer serves "
+                f"{', '.join(sorted(self.volumes)) or 'nothing'}")
+        return [layer]
+
+    def bounds(self, layer: str | None = None) -> Any:
+        """Where the served arrays are, as a :class:`neu_lib.BBox` in viewer voxels.
+
+        The **volume** bounds: the extent of the array itself, offset included, whether or
+        not anything is in it. One layer by name, or the union of all of them. This is what
+        ``enclose(clip="volume")`` clips to, and what to intersect a box of your own with.
+        """
+        from functools import reduce
+
+        from neu_lib import BBox
+
+        boxes = []
+        for name in self._served(layer):
+            volume = self.volumes[name]
+            axes = _spatial_axes(volume.dimensions)
+            scales = [float(volume.dimensions.scales[i]) for i in axes]
+            offset = [int(volume.voxel_offset[i]) for i in axes]
+            shape = [int(volume.shape[i]) for i in axes]
+            boxes.append(self._in_viewer_voxels(
+                offset, [o + s for o, s in zip(offset, shape)], scales))
+        return reduce(BBox.union, boxes, BBox.empty(3))
+
+    def data_bounds(self, layer: str | None = None) -> Any:
+        """Where the non-zero voxels are, as a :class:`neu_lib.BBox` in viewer voxels.
+
+        The **data** bounds, which for a segmentation is where the labels are and is usually
+        far smaller than :meth:`bounds` — a crop is mostly background. One layer by name, or
+        the union of all of them.
+
+        **This reads every voxel of the array.** The arrays are in memory already, so it is
+        a pass over RAM rather than a fetch, but it is not free on a large one: it reduces
+        along each axis in turn rather than building an index array, which keeps the cost to
+        one boolean pass and no allocation per hit.
+
+        A layer holding nothing but zeros raises, rather than returning an empty box that
+        would read downstream as a region with no labels in it.
+        """
+        from functools import reduce
+
+        from neu_lib import BBox
+
+        boxes = []
+        for name in self._served(layer):
+            volume = self.volumes[name]
+            axes = _spatial_axes(volume.dimensions)
+            array = np.asarray(volume.data)
+            if array.ndim == 4:
+                # Channel-first, and a voxel counts if any channel is set there. Reduced
+                # before the per-axis scan so the scan is always over 3 axes.
+                array = array.any(axis=0)
+            mask = array != 0
+            lo, hi = [], []
+            for a in range(3):
+                seen = np.any(mask, axis=tuple(i for i in range(3) if i != a))
+                hits = np.flatnonzero(seen)
+                if hits.size == 0:
+                    raise ServeProblem(
+                        f"layer {name!r} is entirely zero, so it has no data bounds — "
+                        f"clip to bounds() instead, or say which layer to use")
+                lo.append(int(hits[0]))
+                hi.append(int(hits[-1]) + 1)
+            scales = [float(volume.dimensions.scales[i]) for i in axes]
+            offset = [int(volume.voxel_offset[i]) for i in axes]
+            boxes.append(self._in_viewer_voxels([o + v for o, v in zip(offset, lo)],
+                                                [o + v for o, v in zip(offset, hi)],
+                                                scales))
+        return reduce(BBox.union, boxes, BBox.empty(3))
+
+    def _clip_box(self, clip: Any) -> Any:
+        """Resolve ``enclose``'s ``clip=`` to the box to intersect with."""
+        if clip == "volume":
+            return self.bounds()
+        if clip == "data":
+            return self.data_bounds()
+        return _as_bbox(clip, "clip")
+
+    def enclose(self, layer: str | None = None, *, margin: Any = 0,
+                replace: bool = False, clip: Any = None,
+                description: str | None = None) -> Any:
+        """Replace what is drawn with the one box containing it. Returns a `neu_lib.BBox`.
+
+        Dragging a box to exact corners in neuroglancer is fiddly; clicking a point at each
+        corner is not. So: place points around what you want, call this, and get a real box
+        annotation — in the viewer to look at, and as whole voxels zyx to hand to
+        ``--crop-bbox``, :func:`neu_vol.extract_roi` or ``neu-vol write``::
+
+            srv.annotate(tool="point")            # click a point at each extreme
+            box = srv.enclose(margin=16, clip="volume", replace=True)
+            lo, hi = box                          # a BBox unpacks like the pair it is
+
+        **Everything drawn in the layer goes in**, points and boxes alike — and lines,
+        ellipsoids and polylines, which the viewer's own toolbar can place. Enclosing a box
+        that is nearly right is the other half of this: draw roughly, click a point where it
+        should have reached, enclose.
+
+        ``margin`` grows the result on every side, in **voxels** — the units :meth:`boxes`
+        and :meth:`points` already speak. A scalar applies to all three axes; a sequence is
+        per axis, zyx, which is what an anisotropic volume usually wants. Negative shrinks,
+        and a margin that collapses an axis is an error rather than an empty box.
+
+        ``clip`` bounds the result, since a margin reaches happily past the end of the data:
+
+        - ``"volume"`` — the served arrays' own extent, :meth:`bounds`;
+        - ``"data"`` — where their non-zero voxels are, :meth:`data_bounds`, which for a
+          segmentation is where the labels are and is usually far tighter;
+        - a :class:`neu_lib.BBox` or ``(lo, hi)`` pair of your own, e.g.
+          ``clip=srv.bounds("seg")`` to stay inside one particular layer;
+        - ``None``, the default, which does not clip and **warns** if the box starts below
+          zero. Not clipping is the default because this reads a viewer someone is drawing
+          in, and silently returning a smaller box than the one now drawn on their screen is
+          worse than handing back what they asked for.
+
+        A clip that leaves nothing raises: an empty box reads downstream as a region holding
+        no data, which is not what "your margin fell off the edge" means.
+
+        ``replace`` deletes the annotations that went into the box, leaving the layer
+        holding just the result — the usual thing to want, since the points were scaffolding.
+        It is **off by default**: this reads the viewer, and quietly deleting what someone
+        drew is not something to do unasked.
+
+        **With ``replace=False`` the new box is itself an annotation, so calling again
+        encloses it too** — and with a margin, the box grows by that margin every time. That
+        is not a bug to work around, it is what "enclose what is drawn" means; it is the
+        reason ``replace=True`` is the usual call. With no margin it settles, because a box
+        annotation's corners are read as the voxel *boundaries* they are — see
+        :func:`_annotation_bbox`, where the one-voxel difference between a boundary and a
+        position is the whole point.
+        """
+        ng = _neuroglancer()
+        name = layer or self._annotations
+        if name is None:
+            raise ServeProblem("this viewer has no annotation layer to enclose — call "
+                               ".annotate() to add one and draw in it")
+        if name not in self.viewer.state.layers:
+            raise ServeProblem(f"this viewer has no layer named {name!r}")
+
+        drawn = list(self.viewer.state.layers[name].annotations or ())
+        if not drawn:
+            raise ServeProblem(
+                f"nothing is drawn in layer {name!r}, so there is nothing to enclose — "
+                f"place a point or two in the viewer first")
+
+        from functools import reduce
+
+        from neu_lib import BBox
+
+        drawn_boxes = [_annotation_bbox(ann) for ann in drawn]
+        ranks = {b.ndim for b in drawn_boxes}
+        if len(ranks) > 1:
+            raise ServeProblem(
+                f"layer {name!r} holds annotations of {sorted(ranks)} dimensions, which "
+                f"have no common bounding box")
+        found = reduce(BBox.union, drawn_boxes)
+        pad = _margin(margin, found.ndim)
+        lo_pad = tuple(v - p for v, p in zip(found.lo, pad))
+        hi_pad = tuple(v + p for v, p in zip(found.hi, pad))
+        # Checked before the BBox is built, not after: a negative margin can put hi *below*
+        # lo, which BBox rejects outright — a ValueError about rank, where the caller needs
+        # to hear that their margin was too big.
+        if any(h <= l for l, h in zip(lo_pad, hi_pad)):
+            raise ServeProblem(
+                f"margin {pad} leaves an empty box {lo_pad} -> {hi_pad}: it shrinks the "
+                f"annotations past nothing on at least one axis")
+        grown = BBox(lo_pad, hi_pad)
+
+        if clip is None:
+            if any(v < 0 for v in grown.lo):
+                # A negative coordinate is out of bounds in any frame, and the box is
+                # presumably going straight to a reader that will fail on it. Said rather
+                # than fixed, because clipping unasked would hand back a box other than the
+                # one now drawn on the caller's screen.
+                logger.warning(
+                    "enclosing box starts at %s, outside the volume on at least one axis — "
+                    "the margin reaches past the data. Pass clip='volume' to trim it",
+                    grown.lo)
+            box_zyx = grown
+        else:
+            limit = self._clip_box(clip)
+            box_zyx = grown.intersect(limit)
+            if box_zyx.is_empty():
+                raise ServeProblem(
+                    f"clipping {grown.lo} -> {grown.hi} to {limit.lo} -> {limit.hi} leaves "
+                    f"nothing: what was drawn lies outside it on at least one axis")
+            if box_zyx != grown:
+                logger.info("clipped %s -> %s to %s", grown.lo, grown.hi, limit.hi)
+
+        lo, hi = box_zyx
+        box = ng.AxisAlignedBoundingBoxAnnotation(
+            id=uuid.uuid4().hex, point_a=list(lo), point_b=list(hi),
+            description=description)
+        with self.viewer.txn() as s:
+            keep = list(s.layers[name].annotations or ())
+            if replace:
+                # Matched by id against what was actually read, rather than just clearing
+                # the layer, so an annotation the browser added while this was computing
+                # survives. Everything neuroglancer creates carries an id, and so does the
+                # box below.
+                used = {a.id for a in drawn}
+                keep = [a for a in keep if a.id not in used]
+            s.layers[name].annotations = keep + [box]
+
+        logger.info("enclosed %d annotation(s) in %s -> %s%s", len(drawn), lo, hi,
+                    " (originals deleted)" if replace else "")
+        return box_zyx
+
+    def _dimensions(self) -> Any:
+        """The viewer's own coordinate space. See :func:`_annotation_layer`."""
+        dims = self.viewer.state.dimensions
+        if dims is None or not list(dims.names):
+            raise ServeProblem(
+                "this viewer declares no dimensions, so an annotation layer would have no "
+                "coordinate space to record — serve a layer carrying a frame first")
+        return dims
+
     def boxes(self, layer: str | None = None) -> list[tuple[tuple[int, ...], ...]]:
         """Boxes drawn in the viewer, as ``(lo, hi)`` pairs in whole voxels, zyx.
 
@@ -469,9 +1071,10 @@ class Server:
         half-open ``lo < hi``.
         """
         ng = _neuroglancer()
-        name = layer or self._regions
+        name = layer or self._annotations
         if name is None:
-            raise ServeProblem("this viewer has no annotation layer to read boxes from")
+            raise ServeProblem("this viewer has no annotation layer to read boxes from — "
+                               "call .annotate() to add one and draw in it")
         found = []
         for ann in self.viewer.state.layers[name].annotations or ():
             if not isinstance(ann, ng.AxisAlignedBoundingBoxAnnotation):
@@ -486,9 +1089,10 @@ class Server:
     def points(self, layer: str | None = None) -> list[tuple[int, ...]]:
         """Points drawn in the viewer, in whole voxels, zyx."""
         ng = _neuroglancer()
-        name = layer or self._regions
+        name = layer or self._annotations
         if name is None:
-            raise ServeProblem("this viewer has no annotation layer to read points from")
+            raise ServeProblem("this viewer has no annotation layer to read points from — "
+                               "call .annotate(tool='point') to add one and draw in it")
         return [tuple(int(round(float(v))) for v in ann.point)
                 for ann in (self.viewer.state.layers[name].annotations or ())
                 if isinstance(ann, ng.PointAnnotation)]
@@ -640,10 +1244,13 @@ def _opening_view(layers: Sequence[ServedLayer], *, layout: str = "4panel",
 
 
 def serve(layers: Sequence[ServedLayer], *, bind: str | None = None, port: int = 0,
-          into: dict | None = None, regions: str | bool | None = None,
+          into: dict | None = None, annotations: str | bool | None = None,
           position: Sequence[float] | None = None, layout: str = "4panel",
           fit: float = 1.0) -> Server:
     """Host ``layers`` and return a :class:`Server` carrying the viewer URL.
+
+    Each entry is a :class:`ServedLayer`, a :class:`neu_lib.Piece` (which arrives already
+    named and knowing its kind), or the ``dict`` form of a ServedLayer.
 
     ``bind`` / ``port`` set the address the browser must reach. **They take effect only
     before the first viewer in this process** — neuroglancer stores them in a module
@@ -654,10 +1261,12 @@ def serve(layers: Sequence[ServedLayer], *, bind: str | None = None, port: int =
     ``into`` merges the served layers into an existing state (from
     :func:`neu_glance.load_state` or :func:`neu_glance.parse_url`), keeping its view.
 
-    ``regions`` adds an empty local annotation layer to draw in, read back by
+    ``annotations`` adds an empty local annotation layer to draw in, read back by
     :meth:`Server.boxes`. **Off by default** — it is a deliberate workflow, not something
     every look at a crop wants, and a viewer that opens with a layer nobody asked for reads
-    as a bug. ``True`` for the default name, or a name of your own.
+    as a bug. ``True`` for the default name, or a name of your own. :meth:`Server.annotate`
+    adds the same layer to a viewer that is already up, which is the usual way to reach for
+    it: the browser picks the new layer up live, so nothing has to be re-served.
 
     ``position`` overrides where the viewer opens. By default it is **centred on the served
     data and zoomed so the whole piece is in each panel**: neuroglancer with no position
@@ -668,7 +1277,8 @@ def serve(layers: Sequence[ServedLayer], *, bind: str | None = None, port: int =
     cross-section about half the window. ``fit`` above 1 shows more around the data.
     """
     ng = _neuroglancer()
-    layers = [ServedLayer(**ln) if isinstance(ln, dict) else ln for ln in layers]
+    # A ServedLayer, a neu_lib.Piece, or the dict form — the same three `add_layer` takes.
+    layers = [_as_served_layer(ln) for ln in layers]
     if not layers:
         raise ServeProblem("nothing to serve: pass at least one layer")
 
@@ -681,13 +1291,16 @@ def serve(layers: Sequence[ServedLayer], *, bind: str | None = None, port: int =
             ng.set_server_bind_address(bind or "127.0.0.1", port)
 
     viewer = ng.Viewer()
-    volumes: dict[str, Any] = {}
-    used: set[str] = set()
     # The viewer's own dimensions, from the first layer's frame and SPATIAL only — a
     # channel axis is local to the layer, not something to navigate. Set explicitly
     # because a `dimensions` block that disagrees with the data loads cleanly and puts
     # every layer in the wrong place, which is this package's oldest silent failure.
     spatial = _coordinate_space(ng, layers[0].frame, name=layers[0].name)
+    annotate_name = ((ANNOTATE_LAYER if annotations is True else str(annotations))
+                     if annotations else None)
+    # Built before the transaction so the layers can go in through `Server._add_layer_in`,
+    # the same builder `Server.add_layer` uses. It only holds references at this point.
+    server = Server(viewer, {}, annotate_name)
 
     with viewer.txn() as s:
         if not (into and into.get("dimensions")):
@@ -704,44 +1317,17 @@ def serve(layers: Sequence[ServedLayer], *, bind: str | None = None, port: int =
             for existing in into.get("layers", ()):
                 name = existing.get("name")
                 if name:
-                    used.add(name)
                     s.layers[name] = existing
 
         for i, layer in enumerate(layers):
-            name = layer.name or f"{layer.kind}{'' if len(layers) == 1 else i}"
-            # neuroglancer keys a layer by name, so two sharing one is a collision rather
-            # than a duplicate — the same thing `merge_into` renames for.
-            base, n = name, 1
-            while name in used:
-                name, n = f"{base}_{n}", n + 1
-            if name != base:
-                logger.warning("layer name %r was taken; using %r", base, name)
-            used.add(name)
+            # The index-based default is `serve`'s own: only here is the total known, and
+            # `image0`/`image1` reads better than the `image`/`image_1` a bare collision
+            # rename would give. Everything after the name is `_add_layer_in`'s.
+            server._add_layer_in(
+                s, layer, layer.name or f"{layer.kind}{'' if len(layers) == 1 else i}")
 
-            volume = ng.LocalVolume(
-                layer.array,
-                _coordinate_space(ng, layer.frame, channel_axis=layer.channel_axis,
-                                  name=name),
-                volume_type=_volume_type(layer),
-                voxel_offset=_voxel_offset(layer.frame,
-                                           channel_axis=layer.channel_axis, name=name),
-                encoding=ENCODING,
-            )
-            volumes[name] = volume
-            if layer.kind == "segmentation":
-                s.layers[name] = ng.SegmentationLayer(source=volume)
-            else:
-                kwargs: dict[str, Any] = {"source": volume}
-                shader = _shader_for(layer)
-                if shader:
-                    kwargs["shader"] = shader
-                if layer.opacity is not None:
-                    kwargs["opacity"] = float(layer.opacity)
-                s.layers[name] = ng.ImageLayer(**kwargs)
-
-        if regions:
-            name = REGIONS_LAYER if regions is True else str(regions)
-            s.layers[name] = ng.LocalAnnotationLayer(dimensions=spatial)
+        if annotate_name:
+            s.layers[annotate_name] = _annotation_layer(ng, spatial)
         # **Centre on the data and zoom to fit it.** `state.default_view`'s own docstring
         # is about this: with no position neuroglancer opens at the origin CORNER, and with
         # no crossSectionScale at one voxel per pixel — so a crop sitting at voxel 3700 of
@@ -756,9 +1342,6 @@ def serve(layers: Sequence[ServedLayer], *, bind: str | None = None, port: int =
         if layout and not (into and into.get("layout")):
             s.layout = layout
 
-    server = Server(viewer, volumes,
-                    (REGIONS_LAYER if regions is True else str(regions))
-                    if regions else None)
     logger.info("serving %d layer(s) at %s — .stop() or neu_glance.stop_serving() to end it",
-                len(volumes), server.url)
+                len(server.volumes), server.url)
     return server

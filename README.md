@@ -83,6 +83,42 @@ Nanometres are the only space that transfers: the two frames have different voxe
 fraction of what was asked for warns — losing most of it usually means it came from a
 different dataset than the volume.
 
+**A probability map is drawn in one colour with the opacity carrying the value** — red by
+default, so the EM under it stays visible where the model is unsure and is progressively
+covered where it is confident. `color=` picks another, which is how two maps go into one
+viewer distinguishably; the viewer's own control changes it afterwards, and
+`shader="colormap"` restores the older two-colour gradient.
+
+```python
+srv.add_layer(ServedLayer.from_array(pred, "probability", voxel_size=(40, 8, 8)),
+              color="green")     # or "#00ff00", (0, 1, 0), (0, 255, 0)
+```
+
+Colours take a name, `#rrggbb`, or a 3-sequence (floats 0..1, ints 0..255). A short list of
+names — red, green, blue, cyan, magenta, yellow, orange, purple, lime, white, black, gray —
+needs nothing installed; anything else matplotlib names (`"forestgreen"`, `"tab:blue"`)
+works where matplotlib happens to be there, and where it is not you are asked for hex or a
+tuple. **matplotlib is not a dependency and this does not make it one** — every built-in
+name carries matplotlib's own value for it, so installing it later cannot change what a
+colour means.
+
+The colour is set as a `shaderControls` override rather than by generating a shader with a
+different default, so every layer carries the same code and the viewer's panel shows what
+was set. It applies to a shader that has a single colour: `grayscale` has none and `rgb` has
+three, and asking for one there **raises** rather than setting a control neuroglancer would
+ignore in silence.
+
+A `neu_lib.Piece` is itself a layer input, to `serve` and `add_layer` alike — it already
+carries the frame, the kind and a name, so a crop read (or cleaned) with neu-vol goes
+straight to a viewer:
+
+```python
+serve([neu_vol.read_piece("gt.h5:/vol_03700", "segmentation")])
+```
+
+A piece whose `kind` is `None` needs `ServedLayer.from_piece(piece, kind)`, since neither
+call has a `kind=` to pass.
+
 The constructors follow one rule: **infer what the source records, require what it
 does not.** A frame, a dataset name and the channel axis are all written down — in an HDF5
 file's attributes, a precomputed `info`, or the array's own rank — so reading them is not
@@ -91,10 +127,81 @@ has nowhere agreed-on to record it and reading it off the dtype is the mistake n
 itself makes. A volume that records `info["type"]` is the exception, and then `from_volume`
 needs nothing.
 
+**The browser follows the state, so a viewer already open can grow layers.** Nothing is
+re-served and the URL does not change — `srv.add_layer()` hosts one more array, taking the
+same three inputs (and going through the same builder) that `serve` does:
+
+```python
+srv = (serve([em])
+       .add_layer(ServedLayer.from_hdf5("gt.h5", "/vol_03700", "segmentation"))
+       .add_layer(ServedLayer.from_array(pred, "probability", voxel_size=(40, 8, 8)),
+                  name="prediction"))
+```
+
+`add_layer` returns the server, so the calls chain. It does not move the view — adding a
+layer must not change where you are looking — so a layer whose data is elsewhere lands off
+screen, and `srv.bounds("prediction")` is how to find it. A name already taken is renamed,
+not replaced; the resolved name is read off the viewer, `list(srv.volumes)[-1]` being the
+one just added.
+
 `srv.boxes()` closes the loop: pick a region in the viewer, hand it straight to
 `--crop-bbox`, `extract_roi` or `neu-vol write`. It needs an annotation layer to draw in,
-which is **opt-in** — `serve(..., regions=True)` or `--regions` — because a viewer that
-opens with a layer nobody asked for reads as a bug.
+which is **opt-in** — because a viewer that opens with a layer nobody asked for reads as a
+bug. `srv.annotate()` adds one to a viewer that is already open, which is usually where you
+realise you want it; `serve(..., annotations=True)` and `--annotate` open with one already
+there. (The CLI flag is `--annotate`, not `--annotations`: `gen --annotations SOURCE` already
+means a precomputed annotation source to load.)
+
+```python
+srv.annotate()               # a layer to draw in, box tool armed and selected
+                             # ... ctrl+mousedown0 in the viewer to place boxes
+srv.boxes()                  # -> [((lo), (hi)), ...]
+srv.annotate(tool="point")   # same layer, now placing points — nothing drawn is lost
+srv.points()
+```
+
+The browser follows the state, so the layer appears in the tab you already have open —
+nothing is re-served. Calling it again keeps what is already drawn, and `tool` is `"box"`
+or `"point"` only: those are the two `boxes()` and `points()` can read back, and arming a
+line or an ellipsoid would be drawing that never comes back.
+
+Dragging a box to exact corners in neuroglancer is fiddly; clicking a point at each corner
+is not. `srv.enclose()` is the conversion — **the containing box of everything drawn**,
+added to the layer and returned as a `neu_lib.BBox` in whole voxels:
+
+```python
+srv.annotate(tool="point")             # click a point at each extreme
+box = srv.enclose(margin=(1, 8, 8),    # grown per axis, zyx, in voxels
+                  clip="volume",       # ... but not off the end of the data
+                  replace=True)        # the points were scaffolding; drop them
+lo, hi = box                           # a BBox unpacks like the pair it is
+```
+
+Everything in the layer goes in — points, boxes, and the lines, ellipsoids and polylines
+the viewer's own toolbar can place. So the other half of it is fixing a box that is nearly
+right: draw roughly, click a point where it should have reached, `enclose(replace=True)`.
+Corners round **outward** where `boxes()` rounds to nearest, since a box that exists to
+contain things must not round in past the point that put it there. With `replace=False` the
+new box is itself an annotation, so calling again encloses *it* too and a margin grows the
+box each time — which is what "enclose what is drawn" means, and the reason `replace=True`
+is the usual call.
+
+A margin reaches past the end of the array happily, so `clip=` bounds the result against
+the two extents the server can see for itself:
+
+```python
+srv.bounds()                  # the served arrays' extent — clip="volume"
+srv.data_bounds()             # where their non-zero voxels are — clip="data"
+srv.bounds("seg")             # one layer, for clip=srv.bounds("seg")
+```
+
+Both are `BBox`es in viewer voxels, unioned over the served layers or taken one by name, and
+both read each layer's own recorded voxel size — so a second layer served at a coarser scale
+converts rather than being assumed to share the first one's grid. `clip` also takes a `BBox`
+or a plain `(lo, hi)` pair. It is **off by default**: `enclose` reads a viewer somebody is
+drawing in, and handing back a smaller box than the one now on their screen is worse than
+handing back what they asked for — so unclipped it warns when the box starts below zero, and
+a clip that leaves nothing raises rather than returning an empty box.
 
 The viewer opens **centred on the served data and zoomed to fit it**. Neuroglancer's own
 default is the origin *corner* at one voxel per pixel, which for a crop sitting at voxel

@@ -52,7 +52,7 @@ _SHADER_NAMES = ("synapse",)
 #: Image-shader names, duplicated from `shaders.IMAGE_SHADERS` for the same reason
 #: `_ANN_CSV_COLUMNS` is: the parser needs them at build time, and importing the module
 #: then would pull neu-vol into every `neu-glance --help`. A test asserts they agree.
-_IMAGE_SHADER_NAMES = ("grayscale", "colormap", "rgb", "none")
+_IMAGE_SHADER_NAMES = ("grayscale", "probability", "colormap", "rgb", "none")
 
 
 # --------------------------------------------------------------------------- #
@@ -510,9 +510,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "dtype — neuroglancer would read a uint8 label array as an image, "
                         "which loses the colour hashing and the selection UI")
     q.add_argument("--prob", action="append", metavar="SRC",
-                   help="a probability / continuous-scalar source (repeatable). A leading "
-                        "3-channel axis is shown as three colours; one channel gets a "
-                        "gradient with a threshold")
+                   help="a probability / continuous-scalar source (repeatable). One channel "
+                        "is drawn in a single colour with the OPACITY carrying the value, so "
+                        "it composites over the image under it; a leading 3-channel axis is "
+                        "shown as three colours instead")
     q.add_argument("--level", type=int, default=0, metavar="N",
                    help="which level to read from a multiscale --image/--seg/--prob "
                         "(default: 0). Applies to every source")
@@ -528,6 +529,12 @@ def build_parser() -> argparse.ArgumentParser:
                         + ", ".join(_IMAGE_SHADER_NAMES) + "), or 'none' for "
                         "neuroglancer's own default. Default picks by kind and channel "
                         "count")
+    q.add_argument("--color", default=None, metavar="COLOR",
+                   help="colour for the --prob layers (default: red): a name (red, cyan, "
+                        "orange, ...) or #rrggbb. Any colour matplotlib names works too "
+                        "where matplotlib is installed. Applies to a shader with a single "
+                        "colour, which the one-channel default has; the viewer's own "
+                        "control changes it afterwards")
     q.add_argument("--bind", default="127.0.0.1", metavar="ADDRESS",
                    help="the address to serve on (default: 127.0.0.1, reachable only from "
                         "this machine). Use 0.0.0.0 when the browser is elsewhere; the "
@@ -537,7 +544,10 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--into", default=None, metavar="PATH_OR_URL",
                    help="start from an existing state, given as a URL or a JSON file, and "
                         "add the served layers to it — keeping its view")
-    q.add_argument("--regions", nargs="?", const=True, default=False, metavar="NAME",
+    # `--annotate`, not `--annotations`: `gen --annotations SOURCE` already means "load
+    # this precomputed annotation source", and one flag name meaning both that and "make me
+    # an empty layer to draw in" is the kind of thing nobody reads the help for twice.
+    q.add_argument("--annotate", nargs="?", const=True, default=False, metavar="NAME",
                    help="add an empty annotation layer to draw boxes in, read back by "
                         "`Server.boxes()`. Off by default: a viewer that opens with a layer "
                         "nobody asked for reads as a bug. Give a NAME to call it something "
@@ -896,8 +906,13 @@ def cmd_serve(args) -> int:
         # `ServedLayer.from_source` owns the reading, so the notebook path and this one
         # cannot drift — this used to be a second implementation of it here.
         try:
-            layer = ServedLayer.from_source(src, kind, level=args.level, crop=crop,
-                                            voxel_size=voxel_size, shader=args.shader)
+            # --color applies to the probability layers only: it is the one kind whose
+            # default shader has a single colour, and passing it to a grayscale image would
+            # be refused rather than quietly ignored (see `serving._shader_controls`).
+            layer = ServedLayer.from_source(
+                src, kind, level=args.level, crop=crop, voxel_size=voxel_size,
+                shader=args.shader,
+                color=args.color if kind == "probability" else None)
         except ServeProblem as e:
             raise SystemExit(str(e)) from None
         except FileNotFoundError as e:
@@ -919,7 +934,7 @@ def cmd_serve(args) -> int:
 
     try:
         server = serve(layers, bind=args.bind, port=args.port, into=into,
-                       regions=args.regions or None)
+                       annotations=args.annotate or None)
     except ServeProblem as e:
         raise SystemExit(str(e)) from None
 
