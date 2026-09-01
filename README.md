@@ -22,6 +22,7 @@ neu-glance gen --image s3://bucket/em --seg s3://bucket/seg_v1 \
 | `neu-glance serve` | a **running viewer** over arrays held in this process |
 | `neu-glance parse` | a URL back into its state JSON |
 | `neu-glance shaders` | lists or prints the built-in shaders |
+| `neu-glance help` | what `--help` prints, as a subcommand |
 
 The three producers share one output stage. `--format {layer,state,url}` chooses the
 serialization — a bare layer to paste into a state's `layers` array, a whole state for

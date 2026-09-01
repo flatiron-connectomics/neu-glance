@@ -272,3 +272,25 @@ def test_building_the_parser_does_not_pull_in_neu_vol():
             "assert 'neu_vol' not in sys.modules, "
             "'building the parser imported neu_vol'")
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_help_is_a_subcommand_as_well_as_a_flag(capsys):
+    """`neu-glance help serve` and `neu-glance serve --help` are the same thing to everyone
+    except argparse, and being told "invalid choice" for one of them is a poor greeting
+    from a tool whose whole surface is subcommands."""
+    assert cli.main(["help"]) == 0
+    assert "usage: neu-glance" in capsys.readouterr().out
+
+    assert cli.main(["help", "serve"]) == 0
+    printed = capsys.readouterr().out
+    assert "usage: neu-glance serve" in printed and "--color" in printed
+
+    # the same text, because re-parsing means there is no second rendering to drift
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["serve", "--help"])
+    assert capsys.readouterr().out == printed
+
+
+def test_help_for_something_that_is_not_a_command_lists_the_real_ones(capsys):
+    assert cli.main(["help", "nosuch"]) == 2, "argparse's own exit code for a bad choice"
+    assert "invalid choice: 'nosuch'" in capsys.readouterr().err

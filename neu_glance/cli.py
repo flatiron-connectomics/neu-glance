@@ -577,7 +577,42 @@ def build_parser() -> argparse.ArgumentParser:
                    help="print this shader's GLSL. Omit to list them")
     q.set_defaults(func=cmd_shaders)
 
+    _add_help_command(sub)
     return p
+
+
+def _add_help_command(sub) -> None:
+    """``neu-glance help [COMMAND ...]`` — the same text ``--help`` prints.
+
+    Because `help serve` and `serve --help` are the same thing to everyone except argparse:
+    one of the two is what a person types first, and being told "invalid choice" for it is
+    a poor greeting from a tool whose whole surface is subcommands.
+
+    It **re-parses** rather than reaching into the parser, so what it prints cannot drift
+    from ``--help``: it literally is ``--help``. An unknown name gets argparse's own error
+    listing the real choices, which is better than anything written here.
+
+    Not to be confused with ``neu-glance shaders``, which prints a *shader* rather than a
+    usage message.
+    """
+    q = sub.add_parser(
+        "help", help="what `--help` prints, as a subcommand",
+        description="Print the help for the tool, or for one of its subcommands.\n\n"
+                    "`neu-glance help serve` and `neu-glance serve --help` are the same "
+                    "thing.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    q.add_argument("command", nargs="*", metavar="COMMAND",
+                   help="the subcommand to describe (default: the whole tool)")
+    q.set_defaults(func=cmd_help)
+
+
+def cmd_help(args) -> int:
+    """Hand the arguments back to the parser as ``--help``, and report its exit code."""
+    try:
+        build_parser().parse_args([*args.command, "--help"])
+    except SystemExit as e:                      # what --help always does
+        return int(e.code or 0)
+    return 0
 
 
 def _parse_args(argv=None):
