@@ -361,8 +361,15 @@ def headless_browser(url: str, *, size: tuple[int, int] = (1920, 1080),
 
 
 def wait_for_browser(viewer, state: Mapping[str, Any], *, timeout: float = 600.0,
-                     notify_every: float = 15.0, stall_timeout: float = 180.0) -> None:
+                     notify_every: float = 15.0, stall_timeout: float = 180.0,
+                     launched: bool = False) -> None:
     """Push ``state``, then block until a browser has it open and loaded.
+
+    ``launched=True`` when one was started for us: the wait is the same, but telling someone
+    to open a link that is already open — and that nothing will ever be typed into — sends
+    them looking for a step that does not exist, and makes a working headless render look
+    stuck. The failure it reports differs too: a headless browser that never attaches means
+    the process died or cannot reach the port, not that a tab was left unopened.
 
     Without this the first real frame simply sits there: ``capture_screenshots`` pushes a
     state and waits, and an unopened viewer is indistinguishable from a slow one until the
@@ -396,7 +403,11 @@ def wait_for_browser(viewer, state: Mapping[str, Any], *, timeout: float = 600.0
     letters a foot high. Whoever opened that link reasonably concluded the data was broken.
     """
     url = viewer.get_viewer_url()
-    print(f"open this in a browser and leave it open:\n    {url}", file=sys.stderr)
+    if launched:
+        print(f"waiting for the headless browser to load the scene\n    {url}",
+              file=sys.stderr)
+    else:
+        print(f"open this in a browser and leave it open:\n    {url}", file=sys.stderr)
     viewer.set_state(dict(state))
 
     attached, loaded = threading.Event(), threading.Event()
@@ -421,11 +432,18 @@ def wait_for_browser(viewer, state: Mapping[str, Any], *, timeout: float = 600.0
         waited += notify_every
         if not attached.is_set():
             if waited >= timeout:
-                hint = ("\n    The viewer is bound to loopback, so only a browser on this "
-                        "machine can reach it — pass bind='0.0.0.0' or forward the port."
-                        if "localhost" in url or "127.0.0.1" in url else "")
+                if launched:
+                    hint = ("\n    The browser was started here, so it has died or cannot "
+                            "reach the viewer port. Try browser='none' to open one yourself, "
+                            "or gpu=False if the GPU flags are not supported.")
+                elif "localhost" in url or "127.0.0.1" in url:
+                    hint = ("\n    The viewer is bound to loopback, so only a browser on this "
+                            "machine can reach it — pass bind='0.0.0.0' or forward the port.")
+                else:
+                    hint = ""
                 raise RenderProblem(f"no browser attached after {timeout:g}s.\n    {url}{hint}")
-            print(f"still waiting for a browser ({waited:g}s):\n    {url}", file=sys.stderr)
+            print(f"still waiting for {'the headless browser' if launched else 'a browser'} "
+                  f"({waited:g}s)" + ("" if launched else f":\n    {url}"), file=sys.stderr)
             continue
         silent = time.monotonic() - progress["at"]
         if silent >= stall_timeout:
@@ -618,7 +636,7 @@ def record(timeline: Timeline, out_dir: str, *, size: tuple[int, int] = (1920, 1
         return _capture(viewer, **capture)
     with headless_browser(viewer.get_viewer_url(), size=(width, height),
                           binary=browser_binary, gpu=gpu):
-        wait_for_browser(viewer, opening, timeout=connect_timeout)
+        wait_for_browser(viewer, opening, timeout=connect_timeout, launched=True)
         return _capture(viewer, **capture)
 
 

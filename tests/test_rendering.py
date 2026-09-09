@@ -704,3 +704,23 @@ def test_a_caller_supplying_its_own_viewer_launches_nothing(tmp_path, monkeypatc
     call would leave one running per render."""
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("launched a browser"))
     assert record(_timeline(), str(tmp_path), size=(64, 32), viewer=_FakeViewer())
+
+
+def test_a_LAUNCHED_browser_is_not_announced_as_something_to_open(capsys):
+    """Telling someone to open a link that is already open — and that nothing will ever be
+    typed into — sends them looking for a step that does not exist, and makes a working
+    headless render look stuck waiting for them."""
+    viewer = _FakeViewer()
+    wait_for_browser(viewer, _state(), launched=True)
+    err = capsys.readouterr().err
+    assert "open this in a browser" not in err
+    assert "headless browser" in err
+
+
+def test_a_launched_browser_that_never_attaches_blames_the_RIGHT_thing():
+    """A headless browser that never shows up means the process died or cannot reach the
+    port — not that a tab was left unopened, which is what the attended message says."""
+    viewer = _FakeViewer(url="http://127.0.0.1:8080/v/tok/", answers=False)
+    with pytest.raises(RenderProblem, match="died or cannot reach") as excinfo:
+        wait_for_browser(viewer, _state(), timeout=0.3, notify_every=0.1, launched=True)
+    assert "loopback" not in str(excinfo.value)

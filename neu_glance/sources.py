@@ -18,6 +18,7 @@ Two things here fail silently if you get them wrong:
 
 from __future__ import annotations
 
+import functools
 from typing import Any, Mapping, Sequence
 
 from .shaders import SPLIT_CONTROLS, ShaderProblem, pick_shader
@@ -47,6 +48,24 @@ class SourceProblem(RuntimeError):
     """A named volume or annotation source could not be used as a layer source."""
 
 
+def _quiet(fn):
+    """Filter the benign store-credential logging every S3/GCS open emits.
+
+    Wrapped here, not left to the caller: a manual call is worse than the noise, because
+    forgetting it looks identical to the filter being broken. Same treatment
+    `neu_draw.sources` gives its readers. `neu_vol.logs.quiet_reads` nests and is
+    thread-safe; set `neu_vol.logs.reads_quiet = False` to see the raw lines.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        from neu_vol.logs import quiet_reads
+
+        with quiet_reads():
+            return fn(*args, **kwargs)
+    return wrapper
+
+
+@_quiet
 def volume_extent(volume: str, fmt: str) -> tuple[tuple, tuple] | None:
     """``(extent_zyx, offset_zyx)`` in level-0 voxels, or None if not determinable.
 
@@ -81,6 +100,7 @@ def volume_extent(volume: str, fmt: str) -> tuple[tuple, tuple] | None:
     return spatial, (0, 0, 0)
 
 
+@_quiet
 def volume_layer(volume: str, *, kind: str | None = None, name: str | None = None,
                  segments: Sequence[int] | None = None,
                  opacity: float | None = None) -> tuple[dict, dict]:
@@ -122,6 +142,7 @@ def volume_layer(volume: str, *, kind: str | None = None, name: str | None = Non
                    "format": fmt}
 
 
+@_quiet
 def read_annotation_info(source: str) -> dict:
     """The ``info`` of a precomputed annotation source, refusing anything else."""
     from neu_vol.location import read_json
@@ -138,6 +159,7 @@ def read_annotation_info(source: str) -> dict:
     return info
 
 
+@_quiet
 def annotation_layer(source: str, *, name: str | None = None,
                      shader: str | None = None,
                      linked_segmentation: str | None = None,
@@ -189,6 +211,7 @@ def annotation_layer(source: str, *, name: str | None = None,
     return layer, {"info": info, "shader": why, "relationships": relationships}
 
 
+@_quiet
 def annotation_layer_pair(source: str, *, name: str | None = None,
                           shader: str | None = None,
                           linked_segmentation: str | None = None,
@@ -217,6 +240,7 @@ def annotation_layer_pair(source: str, *, name: str | None = None,
     return layers, detail
 
 
+@_quiet
 def annotation_source_extent(info: Mapping[str, Any]) -> tuple[tuple, tuple] | None:
     """``(extent_zyx, offset_zyx)`` from an annotation source's declared bounds.
 
@@ -232,6 +256,7 @@ def annotation_source_extent(info: Mapping[str, Any]) -> tuple[tuple, tuple] | N
     return tuple(max(1.0, h - l) for l, h in zip(lo, hi)), tuple(lo)
 
 
+@_quiet
 def annotation_source_voxel_size(info: Mapping[str, Any]) -> tuple | None:
     """Level-0 voxel size in nm, zyx, from the source's ``dimensions``.
 
@@ -281,6 +306,7 @@ def _readback():
     return readback
 
 
+@_quiet
 def segment_boxes(volume: str, segment_ids: Sequence[Any], *, lod: int | None = None,
                   mesh_dir: str | None = None, threads: int = 8,
                   skip_missing: bool = True) -> dict[str, tuple[tuple, tuple]]:
@@ -356,6 +382,7 @@ def _subresource(volume: str, key: str, info: Mapping[str, Any] | None = None) -
     return str(name)
 
 
+@_quiet
 def segment_labels(volume: str, *, info: Mapping[str, Any] | None = None) -> dict[str, str]:
     """``{segment_id: label}`` from a volume's ``segment_properties`` subresource.
 
@@ -396,6 +423,7 @@ def segment_labels(volume: str, *, info: Mapping[str, Any] | None = None) -> dic
     return dict(zip(ids, [str(v) for v in labels]))
 
 
+@_quiet
 def segment_ids(volume: str, names: Sequence[str], *,
                 info: Mapping[str, Any] | None = None) -> list[str]:
     """Segment ids for ``names``, in order. Raises on a name the source does not carry.
@@ -434,6 +462,7 @@ def segment_ids(volume: str, names: Sequence[str], *,
     return out
 
 
+@_quiet
 def read_segment_properties(volume: str, *, info: Mapping[str, Any] | None = None) -> dict:
     """Everything a volume's ``segment_properties`` carries, in ONE read.
 
@@ -488,12 +517,14 @@ def read_segment_properties(volume: str, *, info: Mapping[str, Any] | None = Non
     return out
 
 
+@_quiet
 def segment_tags(volume: str, *, info: Mapping[str, Any] | None = None) -> dict[str, tuple]:
     """``{segment_id: (tag, ...)}``, tags resolved from their vocabulary indices."""
     read = read_segment_properties(volume, info=info)
     return dict(zip(read["ids"], read["tags"]))
 
 
+@_quiet
 def select_segments(volume: str, *, tags: Sequence[str] | None = None,
                     any_tags: Sequence[str] | None = None,
                     without: Sequence[str] | None = None,
