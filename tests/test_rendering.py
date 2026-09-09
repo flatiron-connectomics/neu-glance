@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -649,8 +650,8 @@ def test_the_launcher_cleans_up_its_throwaway_profile(tmp_path):
     is per-render, so it has to go afterwards or they accumulate."""
     before = set(os.listdir(tempfile.gettempdir()))
     with headless_browser("http://localhost:1/v/x/", size=(64, 64), binary="/bin/sleep",
-                          gpu=False) as process:
-        assert process.pid > 0
+                          gpu=False) as alive:
+        assert alive() is None                      # sleep is still running
     new = [n for n in set(os.listdir(tempfile.gettempdir())) - before
            if n.startswith("neu-glance-render-")]
     assert new == []
@@ -733,3 +734,54 @@ def test_a_launched_browser_that_never_attaches_blames_the_RIGHT_thing():
     with pytest.raises(RenderProblem, match="died or cannot reach") as excinfo:
         wait_for_browser(viewer, _state(), timeout=0.3, notify_every=0.1, launched=True)
     assert "loopback" not in str(excinfo.value)
+
+
+def test_a_browser_that_DIES_at_startup_is_reported_at_once_not_after_the_timeout():
+    """Ten minutes of a silent, motionless run before anything is said — and then the wrong
+    thing, because the attended message blames an unopened tab. `/bin/false` stands in for
+    every environment problem that stops chrome starting."""
+    with headless_browser("http://localhost:1/v/x/", size=(64, 64), binary="/bin/false",
+                          gpu=True) as alive:
+        for _ in range(50):
+            stopped = alive()
+            if stopped:
+                break
+            time.sleep(0.05)
+    assert stopped and "exited with code 1" in stopped
+    assert "gpu=False" in stopped                  # ...and names the likeliest cause
+
+
+def test_a_dead_browser_short_circuits_the_wait():
+    viewer = _FakeViewer(answers=False)
+    with pytest.raises(RenderProblem, match="exited with code"):
+        wait_for_browser(viewer, _state(), timeout=600.0, notify_every=0.05, launched=True,
+                         watch=lambda: "chrome exited with code 1")
+
+
+def test_the_launched_browser_gets_a_PRIVATE_runtime_dir(monkeypatch):
+    """A long-lived tmux server hands its children the environment of the login that started
+    it, including an XDG_RUNTIME_DIR that systemd deletes when that login ends. The variable
+    still points somewhere; the directory is gone. Renders then work from a fresh shell and
+    fail from tmux, which reads as anything but an environment problem."""
+    seen = {}
+
+    class _Fake:
+        def __init__(self, command, **kw):
+            seen.update(env=kw.get("env"), command=command)
+            self.pid = 1
+
+        def poll(self): return None
+
+        def terminate(self): pass
+
+        def wait(self, timeout=None): return 0
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/stale-and-deleted")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/gone")
+    monkeypatch.setattr(subprocess, "Popen", _Fake)
+    with headless_browser("http://x/", size=(64, 64), binary="/bin/true"):
+        runtime = seen["env"]["XDG_RUNTIME_DIR"]
+        assert runtime != "/run/user/stale-and-deleted"
+        assert os.path.isdir(runtime), "it must EXIST, not merely differ"
+    assert "DBUS_SESSION_BUS_ADDRESS" not in seen["env"]
+    assert not os.path.exists(runtime), "and go with the profile afterwards"

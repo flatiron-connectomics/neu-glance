@@ -343,30 +343,75 @@ def headless_browser(url: str, *, size: tuple[int, int] = (1920, 1080),
             f"no browser found (looked for {', '.join(BROWSERS)}). Pass binary=..., or render "
             f"attended by opening the viewer URL yourself — `record(..., browser='none')`.")
     profile = tempfile.mkdtemp(prefix="neu-glance-render-")
+    runtime = os.path.join(profile, "runtime")
+    os.makedirs(runtime, mode=0o700, exist_ok=True)
     command = [executable, *HEADLESS_FLAGS, f"--user-data-dir={profile}",
                f"--window-size={size[0]},{size[1]}", *(GPU_FLAGS if gpu else ()),
                *extra_args, url]
-    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # **A private XDG_RUNTIME_DIR, because a stale one is invisible and fatal.** Chrome puts
+    # sockets there, and a long-lived tmux or screen server hands its children the environment
+    # of the login that STARTED it — including an `XDG_RUNTIME_DIR` that systemd deletes once
+    # that login's last session ends. The variable still points somewhere; the directory is
+    # gone. Renders then work from a fresh shell and fail from tmux, which reads as anything
+    # but an environment problem. A directory of our own removes the question.
+    environment = {**os.environ, "XDG_RUNTIME_DIR": runtime}
+    environment.pop("DBUS_SESSION_BUS_ADDRESS", None)
+
+    log_path = os.path.join(profile, "browser.log")
+    log = open(log_path, "wb")
+    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=log,
+                               env=environment)
     print(f"launched {os.path.basename(executable)} headless"
           f"{' on the GPU' if gpu else ' (software rendering)'}", file=sys.stderr)
+
+    def check() -> str | None:
+        """``None`` while it is running; why it stopped once it has."""
+        code = process.poll()
+        if code is None:
+            return None
+        log.flush()
+        try:
+            with open(log_path, "rb") as f:
+                tail = f.read()[-2000:].decode("utf-8", "replace").strip()
+        except OSError:                                         # pragma: no cover
+            tail = ""
+        detail = ("\n    " + "\n    ".join(tail.splitlines()[-8:])) if tail else ""
+        hint = ""
+        if gpu:
+            hint = ("\n    The GPU flags may not work here — retry with gpu=False "
+                    "(--software-gl), which is slower but needs nothing from the driver.")
+        return (f"{os.path.basename(executable)} exited with code {code} before the render "
+                f"began.{hint}{detail}")
+
     try:
-        yield process
+        yield check
     finally:
         process.terminate()
         try:
             process.wait(timeout=15)
         except subprocess.TimeoutExpired:                       # pragma: no cover
             process.kill()
+        log.close()
         shutil.rmtree(profile, ignore_errors=True)
 
 
-def _await_reply(viewer, *, timeout, notify_every, message, on_timeout):
-    """Block on one screenshot reply, reporting periodically. Raises what `on_timeout` builds."""
+def _await_reply(viewer, *, timeout, notify_every, message, on_timeout, watch=None):
+    """Block on one screenshot reply, reporting periodically. Raises what `on_timeout` builds.
+
+    `watch` is checked each tick and short-circuits the wait. A browser that dies at startup
+    otherwise costs the FULL connect timeout — ten minutes of a silent, motionless run before
+    anything is said — and the message when it finally comes blames the wrong thing.
+    """
     ready = threading.Event()
     viewer.async_screenshot(lambda _reply: ready.set())
     waited = 0.0
     while not ready.wait(max(0.1, notify_every)):
         waited += notify_every
+        if watch is not None:
+            stopped = watch()
+            if stopped:
+                raise RenderProblem(stopped)
         if waited >= timeout:
             raise on_timeout()
         print(f"{message} ({waited:g}s)", file=sys.stderr)
@@ -374,7 +419,7 @@ def _await_reply(viewer, *, timeout, notify_every, message, on_timeout):
 
 def wait_for_browser(viewer, state: Mapping[str, Any], *, timeout: float = 600.0,
                      notify_every: float = 15.0, stall_timeout: float = 180.0,
-                     launched: bool = False) -> None:
+                     launched: bool = False, watch=None) -> None:
     """Push ``state``, then block until a browser has it open and loaded.
 
     ``launched=True`` when one was started for us: the wait is the same, but telling someone
@@ -439,7 +484,8 @@ def wait_for_browser(viewer, state: Mapping[str, Any], *, timeout: float = 600.0
                          "gpu=False if the GPU flags are not supported." if launched else
                          "\n    The viewer is bound to loopback, so only a browser on this "
                          "machine can reach it — pass bind='0.0.0.0' or forward the port."
-                         if "localhost" in url or "127.0.0.1" in url else "")))
+                         if "localhost" in url or "127.0.0.1" in url else "")),
+                 watch=watch)
     print("browser attached; loading the scene", file=sys.stderr)
 
     viewer.set_state(dict(state))
@@ -463,6 +509,10 @@ def wait_for_browser(viewer, state: Mapping[str, Any], *, timeout: float = 600.0
     waited = 0.0
     while not loaded.wait(max(0.1, notify_every)):
         waited += notify_every
+        if watch is not None:
+            stopped = watch()
+            if stopped:
+                raise RenderProblem(stopped)
         silent = time.monotonic() - progress["at"]
         if attached.is_set() and silent >= stall_timeout:
             raise RenderProblem(
@@ -656,8 +706,8 @@ def record(timeline: Timeline, out_dir: str, *, size: tuple[int, int] = (1920, 1
         wait_for_browser(viewer, opening, timeout=connect_timeout)
         return _capture(viewer, **capture)
     with headless_browser(viewer.get_viewer_url(), size=(width, height),
-                          binary=browser_binary, gpu=gpu):
-        wait_for_browser(viewer, opening, timeout=connect_timeout, launched=True)
+                          binary=browser_binary, gpu=gpu) as alive:
+        wait_for_browser(viewer, opening, timeout=connect_timeout, launched=True, watch=alive)
         return _capture(viewer, **capture)
 
 
