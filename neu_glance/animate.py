@@ -523,6 +523,11 @@ class _Nothing:
 #: Distinct from ``None``, which is a legitimate property value.
 _NOTHING = _Nothing()
 
+#: How close two window edges have to be to count as touching rather than overlapping.
+#: A nanosecond is far below any timing an animation expresses — the shortest sensible
+#: interval is a frame, ~33 ms — and far above the float error in the sums that produce them.
+_TIME_EPSILON = 1e-9
+
 
 # --------------------------------------------------------------------------- #
 # the timeline
@@ -757,7 +762,15 @@ class Timeline:
             # way to write a there-and-back. Genuine overlap is not: silently dropping one of
             # two fades on one property would leave an animation that is subtly wrong and has
             # nothing anywhere to point at.
-            if tween.at < other.stop and other.at < tween.stop:
+            #
+            # The tolerance is what makes "abutting" survive arithmetic. A caller building a
+            # sequence writes `start + i * step` for one window and `start + (i+1) * step` for
+            # the next, and those reach the same instant by different routes:
+            # `4.0 + 7*0.8 + 0.8` is 10.400000000000002 while `4.0 + 8*0.8` is 10.4. Without
+            # a tolerance a perfectly-formed follow-the-action sequence is refused for an
+            # overlap of two femtoseconds, and the message is baffling because the printed
+            # numbers are identical.
+            if tween.at < other.stop - _TIME_EPSILON and other.at < tween.stop - _TIME_EPSILON:
                 raise AnimateProblem(
                     f"two tweens on {_describe(tween.path)} overlap: "
                     f"[{other.at:g}, {other.stop:g}] and [{tween.at:g}, {tween.stop:g}]. "

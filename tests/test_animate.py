@@ -224,6 +224,29 @@ def test_two_tweens_overlapping_on_one_property_are_refused():
     tl.tween(layer="s", at=2.0, seconds=1.0, objectAlpha=1.0)            # abutting: allowed
 
 
+def test_windows_that_ABUT_survive_the_arithmetic_that_produced_them():
+    """`start + i*step` and `start + (i+1)*step` reach the same instant by different routes.
+
+    `4.0 + 7*0.8 + 0.8` is 10.400000000000002; `4.0 + 8*0.8` is 10.4. Without a tolerance a
+    correctly-built follow-the-action sequence is refused for an overlap of two femtoseconds,
+    and the message is baffling because the two printed numbers are identical.
+    """
+    tl = Timeline(_state(_seg("s", ["1"])), fps=10.0)
+    start, step = 4.0, 0.8
+    for i in range(12):                       # long enough for the error to accumulate
+        tl.frame_on(((0.0, 0.0, 0.0), (float(i + 1),) * 3), at=start + i * step,
+                    seconds=step, units="voxels")
+    assert len(tl.tweens) == 24               # position + projectionScale each
+
+
+def test_a_REAL_overlap_is_still_refused():
+    """The tolerance must not turn the guard off — a nanosecond, not a free pass."""
+    tl = Timeline(_state(_seg("s", ["1"])), fps=10.0)
+    tl.tween(layer="s", at=0.0, seconds=2.0, objectAlpha=0.0)
+    with pytest.raises(AnimateProblem, match="overlap"):
+        tl.tween(layer="s", at=1.999, seconds=2.0, objectAlpha=1.0)
+
+
 def test_a_tween_naming_a_layer_that_is_not_there_RAISES():
     """Neuroglancer's own Layers.interpolate silently skips an unmatched layer.
 
