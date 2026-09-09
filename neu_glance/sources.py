@@ -251,3 +251,80 @@ def annotation_source_voxel_size(info: Mapping[str, Any]) -> tuple | None:
             return None
         out.append(float(scale) * 1e9)
     return tuple(reversed(out))                        # xyz read, zyx returned
+
+
+def _readback():
+    """`neu_morpho.readback`, or a clear error naming the extra.
+
+    **This is a `neu-codecs` dependency wearing neu-morpho's clothes**, not a new hole in the
+    layering. `RENAME-PLAN.md`'s stage 6 already AGREES that `neu_morpho/readback.py` — "the
+    mesh and skeleton readers" — belongs in a bottom-tier `neu-codecs` package beside
+    blockrun, because decoding the precomputed format needs no store and no meshing library.
+    neu-draw reached for the same reader for the same reason and took the same temporary
+    dependency (`neu_draw/sources.py`, its `sources` extra). So this is a **second consumer
+    confirming that extraction**, and when stage 6 lands it becomes an ordinary downward
+    dependency and this function changes by one import line.
+
+    Until then it is deferred and behind an extra, exactly like `serving._neuroglancer`, so
+    `import neu_glance` and every pure path stay off neu-morpho's import graph and neu-glance's
+    conda-free CI is unaffected. Verified: `readback` imports with `vol2mesh`, `dvidutils`,
+    `neuclease` and `kimimaro` all absent, pulling in only numpy — the conda-only packages are
+    the *meshing* pipeline's, not the reader's.
+    """
+    try:
+        from neu_morpho import readback
+    except ImportError as e:
+        raise SourceProblem(
+            f"reading an object's bounds needs neu-morpho's mesh reader, which is not "
+            f"installed: {e}. Install it with `pip install 'neu-glance[framing]'`, or pass "
+            f"boxes to Timeline.frame_on() yourself — it takes any (lo_zyx, hi_zyx).") from None
+    return readback
+
+
+def segment_boxes(volume: str, segment_ids: Sequence[Any], *, lod: int | None = None,
+                  mesh_dir: str | None = None, threads: int = 8,
+                  skip_missing: bool = True) -> dict[str, tuple[tuple, tuple]]:
+    """``{segment_id: (lo_zyx, hi_zyx)}`` in **nanometres**, from each segment's mesh.
+
+    What :meth:`neu_glance.animate.Timeline.frame_on` needs in order to point the camera at a
+    named object rather than at coordinates someone read off the screen.
+
+    **The mesh is the right source for this, which is why it is worth the layering
+    exception.** The obvious alternative — read a coarse level of the segmentation and take
+    each label's extent — needs no new dependency but is wrong in a way that does not
+    announce itself: a thin arbor thins out of existence on the way down a pyramid (the
+    suite's OCCUPANCY-DILATION invariant is about exactly this non-convergence), so a neuron
+    gets a box that is too small, or no box at all, and the camera frames the wrong thing. A
+    mesh's vertices are the object.
+
+    Cheap despite that: ``lod=None`` takes the **coarsest** level of detail, which is a small
+    download and gives bounds indistinguishable from LOD 0's for framing. `readback` also
+    handles sharded and unsharded sources alike and applies a foreign source's own
+    ``transform``, so bounds come back in the same nanometre model space everything else
+    uses — the NM-SPACE invariant — rather than in whatever the publisher happened to store.
+
+    ``skip_missing`` drops a segment with no mesh; a structurally broken source still raises,
+    since "no meshes here" and "this reader cannot decode this" look identical otherwise.
+    """
+    readback = _readback()
+    ids = [str(s).lstrip("!") for s in segment_ids]
+    boxes: dict[str, tuple[tuple, tuple]] = {}
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(sid: str):
+        raw = readback.read_body_mesh(volume, int(sid), mesh_dir=mesh_dir, lod=lod)
+        if raw is None:
+            return sid, None
+        vertices = raw[0]
+        lo = tuple(float(v) for v in vertices.min(axis=0)[::-1])   # stored xyz, wanted zyx
+        hi = tuple(float(v) for v in vertices.max(axis=0)[::-1])
+        return sid, (lo, hi)
+
+    with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
+        for sid, box in pool.map(one, ids):
+            if box is not None:
+                boxes[sid] = box
+            elif not skip_missing:
+                raise SourceProblem(f"{volume} has no mesh for segment {sid}")
+    return boxes

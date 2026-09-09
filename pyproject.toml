@@ -27,6 +27,14 @@ dev = ["pytest"]
 # and open a viewer on it, the way chunkflow does. Optional because building a state needs
 # none of it, and because the wheel carries a JS bundle.
 serve = ["neuroglancer>=2.40"]
+# Pointing the camera at a named object needs that object's bounds, and the mesh is the only
+# honest source for them — a thin arbor thins out of existence on the way down a pyramid, so
+# a coarse volume read frames the wrong thing without saying so. `neu_morpho.readback` is the
+# reader, and RENAME-PLAN stage 6 already AGREES it belongs in a bottom-tier `neu-codecs`
+# beside blockrun; neu-draw took the same temporary dependency for the same reason. Optional
+# and deferred (`sources._readback`), so CI, `import neu_glance` and every pure path are
+# unaffected — and `Timeline.frame_on` takes a box from anywhere, so this is never required.
+framing = ["neu-morpho"]
 
 [project.scripts]
 # `neu-glance`, matching the abbreviated commands its siblings expose (`neu-vol`, `neu-morpho`,

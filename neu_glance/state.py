@@ -189,6 +189,121 @@ def load_state(source: str, read_bytes=None) -> dict:
     return obj
 
 
+def split_segment_layer(state: Mapping[str, Any], layer: str, *,
+                        segments: Sequence[Any] | None = None,
+                        names: Mapping[str, str] | None = None,
+                        name_template: str = "{layer} {segment}",
+                        object_alpha: float | None = None,
+                        ) -> tuple[dict, dict[str, str], list[str]]:
+    """One layer per segment, so each can be shown, coloured or FADED on its own.
+
+    Returns ``(state, {segment_id: layer_name}, notes)``.
+
+    **Neuroglancer has no per-segment alpha.** ``objectAlpha`` is a property of the layer —
+    the mesh draw path is literally ``if (objectAlpha <= 0) return`` — so a scene where one
+    neuron fades in while its neighbour holds still has to be a scene with one layer per
+    neuron. Every copy names the same ``source``, and neuroglancer memoizes a datasource per
+    URL, so the ``info`` is read once and each mesh is fetched once however many layers point
+    at it.
+
+    Each copy is the original layer **verbatim**, then overridden. That is what carries
+    ``selectedAlpha``, ``meshSilhouetteRendering``, ``saturation``, ``colorSeed`` and whatever
+    else the state happens to hold, with no whitelist here to go stale against a viewer
+    release.
+
+    **The colours come out identical, including hashed ones.** An explicit entry in
+    ``segmentColors`` is carried across (restricted to the one segment, so the copy holds no
+    dead entries). A segment with no entry is hash-coloured by neuroglancer from
+    ``(colorSeed, segment_id)`` and nothing else, both of which the verbatim copy preserves —
+    so it keeps exactly the colour it had. Getting this wrong would give a perfectly
+    attractive scene in entirely the wrong colours, with nothing anywhere to say so.
+
+    Three details, each of which fails quietly:
+
+    - **A ``!``-prefixed id is starred but NOT visible.** Those do not become layers; they
+      stay on the original, which keeps the stars a user set.
+    - **The original layer is kept**, emptied and hidden, rather than removed. It is named by
+      ``selectedLayer``, by a synapse layer's ``linkedSegmentationLayer``, and possibly by a
+      ``toolPalettes`` entry; neuroglancer resolves a dangling layer name to nothing without
+      complaining. (The flip side, worth knowing: a synapse layer filtering on that layer now
+      filters on an empty segment set, so re-point it at one of the copies if you turn it on.)
+    - **Each copy replaces the original IN PLACE** in the ``layers`` array rather than being
+      appended. Neuroglancer draws in layer order, so moving twenty-five layers to the end
+      changes what is in front of what.
+
+    Segment ids stay **strings** throughout, the same reason :func:`neu_glance.volume_layer`
+    keeps them: a 19-digit uint64 through a JSON number comes back rounded.
+    """
+    out = json.loads(json.dumps(dict(state)))            # deep copy; never mutate the caller's
+    existing = list(out.get("layers") or [])
+    index = next((i for i, lyr in enumerate(existing)
+                  if isinstance(lyr, dict) and lyr.get("name") == layer), None)
+    if index is None:
+        known = ", ".join(repr(lyr.get("name")) for lyr in existing if isinstance(lyr, dict))
+        raise StateProblem(f"no layer named {layer!r} in this state. It has: {known}")
+
+    source = existing[index]
+    if source.get("type") != "segmentation":
+        raise StateProblem(
+            f"layer {layer!r} is a {source.get('type')!r} layer; only a segmentation layer "
+            f"has segments to split")
+
+    raw = [str(s) for s in (source.get("segments") or [])]
+    starred = [s for s in raw if s.startswith("!")]
+    visible = [s for s in raw if not s.startswith("!")]
+    if segments is not None:
+        wanted = [str(s) for s in segments]
+        missing = [s for s in wanted if s not in visible]
+        if missing:
+            raise StateProblem(
+                f"layer {layer!r} has no visible segment(s) {', '.join(missing)}. Its visible "
+                f"segments are: {', '.join(visible) or '(none)'}"
+                + (f". {', '.join(starred)} are starred but hidden ('!'), so they cannot be "
+                   f"split" if starred else ""))
+        visible = wanted
+
+    notes: list[str] = []
+    if not visible:
+        notes.append(f"layer {layer!r} has no visible segments, so nothing was split")
+
+    colors = {str(k): v for k, v in (source.get("segmentColors") or {}).items()}
+    taken = {lyr.get("name") for lyr in existing if isinstance(lyr, dict)}
+    created: dict[str, str] = {}
+    copies: list[dict] = []
+
+    for i, sid in enumerate(visible):
+        copy = json.loads(json.dumps(source))
+        copy["segments"] = [sid]
+        if sid in colors:
+            copy["segmentColors"] = {sid: colors[sid]}
+        else:
+            copy.pop("segmentColors", None)
+        if object_alpha is not None:
+            copy["objectAlpha"] = float(object_alpha)
+        copy.pop("visible", None)
+
+        name = (names or {}).get(sid) or name_template.format(
+            layer=layer, segment=sid, index=i)
+        if name in taken:
+            suffix = 2
+            while f"{name}-{suffix}" in taken:
+                suffix += 1
+            notes.append(f"renamed split layer {name!r} to {name}-{suffix}: the state already "
+                         f"has a layer by that name")
+            name = f"{name}-{suffix}"
+        taken.add(name)
+        copy["name"] = name
+        created[sid] = name
+        copies.append(copy)
+
+    emptied = json.loads(json.dumps(source))
+    emptied["segments"] = starred
+    emptied.pop("segmentColors", None)
+    emptied["visible"] = False
+    out["layers"] = existing[:index] + copies + [emptied] + existing[index + 1:]
+    return out, created, notes
+
+
 def _read_json(path: str, read_bytes=None):
     if read_bytes is None:
         from neu_vol.location import read_bytes as read_bytes_impl

@@ -1157,7 +1157,10 @@ class Server:
         """A PNG of what the browser is showing. Blocks until it replies.
 
         Requires a **connected browser** — the image is rendered by the client and posted
-        back, so this raises if nobody has the link open.
+        back. With nobody on the link this does not raise, it **blocks forever**:
+        ``viewer_base.screenshot`` waits on the reply with no timeout. See
+        :func:`neu_glance.rendering.wait_for_browser` for the bounded form, which is what a
+        render loop needs.
         """
         reply = self.viewer.screenshot().screenshot
         if path is None:

@@ -220,6 +220,88 @@ Three things about it that are not obvious:
   volume it came from rather than at nm zero. A source that records one (`neu-vol to-hdf5`
   writes it) needs no `--voxel-size`.
 
+## Animating a state
+
+A `Timeline` wraps one base state — the link you tuned in the browser — and a list of tweens
+over it. Each tween names one property, a window in time and an easing; everything no tween
+mentions holds its base value.
+
+```python
+from neu_glance import load_state
+from neu_glance.animate import Timeline
+from neu_glance.rendering import record
+
+tl = Timeline(load_state("scene.json"), fps=30)
+
+# Neuroglancer's objectAlpha is per LAYER and there is no per-segment alpha, so an object
+# that fades on its own has to be a layer on its own. split() does that, and hands back
+# {segment_id: layer_name} so groups are written against segment ids.
+neurons = tl.split("my-segmentation", prefix="neuron")
+rois    = tl.split("my-rois",         prefix="roi")
+
+tl.tween(layer="my-head-mask", at=1, seconds=3, ease="out",
+         meshSilhouetteRendering=10)                    # opaque shell -> transparent one
+
+tl.group("chain-1", [neurons["3832372"], rois["20"], rois["30"]])
+tl.group("chain-2", [neurons["10063300"], rois["26"]])
+tl.sequence(["chain-1", "chain-2"], start=4, seconds=1.2, stagger=0.8)
+
+tl.view("https://neuroglancer-demo.appspot.com/#!...", at=6, seconds=9)
+
+record(tl, "frames/", size=(1920, 1080))                # prints a URL; open it and wait
+```
+
+### Moving the camera
+
+Three ways, which compose:
+
+```python
+tl.view(url, at=6, seconds=9)          # ABSOLUTE: fly it in the browser, paste the link
+tl.orbit(360, at=6, seconds=10)        # RELATIVE: a turntable about the screen's vertical
+tl.orbit(180, axis="z", at=6, seconds=8)   # ...or about a volume axis, reproducibly
+tl.zoom(0.5, at=6, seconds=10)         # RELATIVE: half the scale = twice as close
+tl.frame_on(box, at=2, seconds=3)      # point at an object and fit it
+```
+
+**`orbit` is not sugar for two `view()` calls.** Slerp takes the shortest arc between two
+orientations, so a 360° turn is a no-op — the two ends are the same rotation — and 200°
+silently becomes 160° the other way. Orbit varies the *angle*, so any rotation works. Verified
+against a real render: 0° and 360° come back pixel-identical.
+
+`frame_on` takes `(lo_zyx, hi_zyx)` in nanometres by default (the suite's model space), and
+converts to the viewer's own voxels using the state's `dimensions`. Boxes can come from
+anywhere; `sources.segment_boxes(volume, ids)` reads them from the segments' meshes, which
+needs `neu-glance[framing]`.
+
+```python
+boxes = neu_glance.sources.segment_boxes(volume, ["3832372"])
+tl.frame_on(boxes["3832372"], at=2, seconds=3)
+tl.orbit(360, at=5, seconds=12)        # ...then turn around it
+```
+
+`record` prints the `ffmpeg` line to turn the frames into an mp4 and does not run it — a
+render takes hours and an encode takes seconds, so a failed encode should cost nothing, and
+`ffmpeg` is often a module rather than something on `PATH`.
+
+Four things worth knowing:
+
+- **`view()` takes a URL.** Framing a 3D view is done by dragging, not by writing
+  quaternions, so the intended loop is to fly the camera in the browser, copy the link, and
+  paste it. Only the camera keys are taken — the target's layers and layout are ignored.
+- **The cursor moves only on `hold()`.** Two tweens written one after the other run
+  *together*, because fading while moving is the common case.
+- **Interrupting is safe and re-running resumes.** Frames are written atomically and a
+  resumed render checks the PNG signature, not just that a file exists.
+- **`neu_glance.animate` is pure** — stdlib only, no neuroglancer — so a timeline can be
+  built, sampled and tested with nothing installed. `tl.at(4.5)` is just a state dict, and
+  `state_url` turns any moment into a link you can open.
+
+Everything in `animate` is deliberately ours rather than `neuroglancer.ViewerState.interpolate`,
+which in 2.41.2 raises `AttributeError` for a state carrying any layer (`Layer.interpolate`
+reads `layer_position`; the property is `localPosition`), covers neither
+`meshSilhouetteRendering` nor `segmentColors`, and materialises orientation keys the input
+never had.
+
 ## Things that fail silently, and where they are handled
 
 Neuroglancer is forgiving in the worst way: a wrong state loads cleanly and shows you
@@ -243,18 +325,27 @@ the four worth knowing up front:
 
 ```
 neu_glance/
-├── layers.py    local annotation layers — from coordinates, or from occupancy boxes
-├── sources.py   layers for something on a store: a volume, an annotation source
-├── serving.py   host arrays HERE and run a viewer on them; the only neuroglancer import
-├── shaders.py   GLSL, and the rule for choosing one — annotation and image families
-├── state.py     assemble a state, encode a URL, read one back, merge into one
-└── cli.py       neu-glance
+├── animate.py    a timeline of tweens over one state, and the interpolation under it
+├── layers.py     local annotation layers — from coordinates, or from occupancy boxes
+├── rendering.py  drive a viewer frame by frame and write PNGs
+├── sources.py    layers for something on a store: a volume, an annotation source
+├── serving.py    host arrays HERE and run a viewer on them
+├── shaders.py    GLSL, and the rule for choosing one — annotation and image families
+├── state.py      assemble a state, encode a URL, read one back, merge into one, split a layer
+└── cli.py        neu-glance
 ```
 
-`layers.py` and `state.py` are **pure** — plain data in, plain data out, no store access —
-and `sources.py` is the only module that reads anything. That line is deliberate: a layer
-whose source is a locally served volume has no store to inspect, so state assembly must never
-require one.
+`layers.py`, `state.py` and `animate.py` are **pure** — plain data in, plain data out, no
+store access — and `sources.py` is the only module that reads anything. That line is
+deliberate: a layer whose source is a locally served volume has no store to inspect, so state
+assembly must never require one, and a timeline's interpolation stays covered by a CI that
+installs no extras.
+
+`serving.py` and `rendering.py` are the two that need a viewer. **Neither imports
+`neuroglancer` at module scope** — every such import is inside the function that needs it,
+which is what keeps `import neu_glance` and `neu-glance --help` off that import graph. A test
+checks the indentation rather than the filename, because "only `serving.py` imports it" was
+only ever a proxy for the rule that matters.
 
 ## Install
 

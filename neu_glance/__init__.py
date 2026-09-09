@@ -14,13 +14,19 @@ Three things it makes, all from the same pieces:
 - a **layer** of local annotations, from coordinates or from occupancy boxes
   (:mod:`neu_glance.layers`)
 
-and one thing it *runs*: a viewer over arrays held in this process
-(:mod:`neu_glance.serving`), for looking at something that is not published — a
-ground-truth crop, a box out of a volume, a probability map straight out of a model.
+and two things it *runs*, both of which need a browser:
 
-:mod:`neu_glance.layers` and :mod:`neu_glance.state` are pure — plain data in, plain data out, no
-store access — and :mod:`neu_glance.sources` is the only module that reads anything. Keeping that
-line is what will let a locally served volume become a layer without touching state assembly.
+- a **viewer** over arrays held in this process (:mod:`neu_glance.serving`), for looking at
+  something that is not published — a ground-truth crop, a box out of a volume, a probability
+  map straight out of a model;
+- an **animation** (:mod:`neu_glance.animate` + :mod:`neu_glance.rendering`) — a timeline of
+  tweens over one base state, rendered frame by frame through a real viewer.
+
+:mod:`neu_glance.layers`, :mod:`neu_glance.state` and :mod:`neu_glance.animate` are pure —
+plain data in, plain data out, no store access — and :mod:`neu_glance.sources` is the only
+module that reads anything. Keeping that line is what will let a locally served volume become
+a layer without touching state assembly, and it is why a timeline's interpolation is covered
+by a CI that installs no extras.
 
 Top-level names resolve lazily (PEP 562) so ``neu-glance --help`` does not pay for
 neu-vol' import graph; ``cli`` reads ``__version__`` from here.
@@ -41,6 +47,17 @@ _EXPORTS = {
     "merge_into": "state",
     "default_view": "state",
     "annotation_extent": "state",
+    "split_segment_layer": "state",
+    # Animation. `animate` is pure — stdlib only, no neuroglancer — so it costs nothing to
+    # reach; `rendering` needs a viewer and stays behind the same `serve` extra as `serving`.
+    "Timeline": "animate",
+    "Tween": "animate",
+    "EASINGS": "animate",
+    "AnimateProblem": "animate",
+    "record": "rendering",
+    "render_state": "rendering",
+    "ffmpeg_command": "rendering",
+    "RenderProblem": "rendering",
     "volume_layer": "sources",
     "volume_extent": "sources",
     "annotation_layer": "sources",

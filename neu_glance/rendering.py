@@ -1,0 +1,547 @@
+"""Render a :class:`neu_glance.animate.Timeline` to a sequence of PNGs, through a real viewer.
+
+Neuroglancer renders in the browser, so a frame is a round trip: Python pushes a state, the
+client loads whatever chunks that state makes visible, draws, and posts the image back.
+:mod:`neu_glance.animate` decides *what* each frame is; this module is the part that needs a
+browser, and it is deliberately the smaller half.
+
+**A browser you open yourself is the default.** ``neuroglancer.webdriver`` can drive a
+headless Chrome, but it needs selenium and a matching chromedriver, and neither is a given.
+:func:`record` starts a viewer, prints its URL and waits for you to open it — which needs
+nothing installed beyond ``neu-glance[serve]`` and works the first time.
+
+**Every neuroglancer import here is deferred**, inside the function that needs it, and the
+missing-extra error comes from :func:`neu_glance.serving._neuroglancer` so there is one
+message rather than two. This is the second module in the package to import neuroglancer at
+all — the rule that matters is not "only ``serving.py`` does" but "no module does it at
+*module scope*", so that ``import neu_glance``, ``neu-glance --help`` and every pure path stay
+off that import graph. ``test_rendering.py`` checks the indentation to enforce it.
+
+Three things this does that ``neuroglancer.tool.screenshot`` does not, each learned from the
+way it fails:
+
+* **A wrong-sized reply is never written.** ``async_screenshot`` has no size retry, where
+  ``Viewer.screenshot`` retries five times — so a short window can silently yield frames at
+  two different sizes, and ffmpeg finds out hours later.
+* **Frames are written atomically and resume checks the PNG signature.** ``os.path.exists``
+  alone treats a frame killed mid-write as done, and one corrupt frame in seven hundred is
+  not noticed until the encode.
+* **There is a cap on browser refreshes.** Upstream retries forever, so an unattended render
+  against a dead tab hangs until someone looks.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import sys
+import threading
+import time
+from collections import deque
+from typing import Any, Mapping
+
+from .animate import Timeline
+from .serving import _neuroglancer
+
+#: The first eight bytes of any PNG. A resumed render checks for these rather than trusting
+#: that a file exists — see the module docstring.
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+#: Panels and chrome that must be off in a rendered frame. Set on the state, not per frame:
+#: two places shaping a frame is how the two drift, and every such failure renders something
+#: plausible rather than raising.
+CHROME_OFF = {
+    "selectedLayer": {"visible": False},
+    "statistics": {"visible": False},
+    "layerListPanel": {"visible": False},
+    "helpPanel": {"visible": False},
+}
+
+
+class RenderProblem(RuntimeError):
+    """A render could not start, or could not finish the frame it was on."""
+
+
+class _Tail(io.TextIOBase):
+    """A bounded sink for the capture loop's chatter: keeps the last few lines, drops the rest.
+
+    Bounded rather than a plain buffer because a stalled render emits a statistics line per
+    second indefinitely, and the point of quiet mode is not to trade a wall of text for a
+    memory leak.
+    """
+
+    def __init__(self, keep: int = 40) -> None:
+        self.lines: deque[str] = deque(maxlen=keep)
+        self._partial = ""
+
+    def write(self, text: str) -> int:
+        self._partial += text
+        while "\n" in self._partial:
+            line, self._partial = self._partial.split("\n", 1)
+            if line.strip():
+                self.lines.append(line.strip())
+        return len(text)
+
+
+class _Progress:
+    """A tqdm bar, or periodic lines, or nothing — one interface over all three.
+
+    **tqdm is used only if it happens to be installed**, the treatment `shaders.py` gives
+    matplotlib: it is not declared anywhere in this package and must not become a dependency
+    for a convenience. The fallback is not a degraded mode — periodic lines with an ETA are
+    what you want in a log file or a batch job anyway, where a `\\r` bar renders as thousands
+    of concatenated lines.
+
+    The bar owns the terminal while it is up. `NOTES-neu-mark.md` records what happens
+    otherwise: tqdm writes `\\r` without newlines, so anything else printing meanwhile lands
+    on the same line and the result is unreadable. That is why `record` swallows the capture
+    loop's per-frame prints whenever a bar is showing.
+    """
+
+    def __init__(self, total: int, *, verbose: bool = False, description: str = "rendering",
+                 stream=None, min_interval: float = 10.0) -> None:
+        self.total, self.verbose, self.min_interval = total, verbose, min_interval
+        self.stream = stream or sys.stderr
+        self.done = 0
+        self.started = self.last = time.monotonic()
+        self.bar = None
+        if verbose:
+            return
+        try:
+            from tqdm.auto import tqdm
+        except ImportError:
+            print(f"{description}: {total} frames", file=self.stream)
+        else:
+            self.bar = tqdm(total=total, unit="frame", desc=description, file=self.stream,
+                            dynamic_ncols=True)
+
+    def advance(self, _path: str | None = None) -> None:
+        self.done += 1
+        if self.bar is not None:
+            self.bar.update(1)
+            return
+        if self.verbose:
+            return
+        now = time.monotonic()
+        if now - self.last < self.min_interval and self.done < self.total:
+            return
+        self.last = now
+        per = (now - self.started) / max(1, self.done)
+        left = per * (self.total - self.done)
+        print(f"  {self.done}/{self.total} frames ({self.done / max(1, self.total):.0%}), "
+              f"{per:.2f}s/frame, ~{left / 60:.1f} min left", file=self.stream)
+
+    def close(self) -> None:
+        if self.bar is not None:
+            self.bar.close()
+            self.bar = None
+
+
+# --------------------------------------------------------------------------- #
+# shaping the state
+# --------------------------------------------------------------------------- #
+def render_state(state: Mapping[str, Any], *, show_axis_lines: bool = False,
+                 show_default_annotations: bool = False,
+                 show_scale_bar: bool | None = None,
+                 gpu_memory_limit: int | None = None,
+                 system_memory_limit: int | None = None,
+                 concurrent_downloads: int | None = None) -> dict:
+    """A state with the viewer's furniture switched off, ready to be a frame.
+
+    Applied **once to the base state before interpolation**, never per frame afterwards.
+
+    The two annotation-ish defaults are inverted from neuroglancer's own on purpose: a viewer
+    shows axis lines and each volume's bounding box because they help you navigate, and a
+    rendered animation of meshes almost never wants either. They are still switchable, since a
+    scale bar in particular is sometimes exactly the point.
+
+    The three memory knobs matter once a scene is twenty-five mesh layers. Neuroglancer's own
+    screenshot tool defaults them to 3 GiB / 3 GiB / 32; left alone here, so the viewer's
+    defaults apply unless a caller has a reason.
+    """
+    out = json.loads(json.dumps(dict(state)))
+    for key, value in CHROME_OFF.items():
+        existing = out.get(key)
+        out[key] = {**existing, **value} if isinstance(existing, dict) else dict(value)
+    out["showAxisLines"] = bool(show_axis_lines)
+    out["showDefaultAnnotations"] = bool(show_default_annotations)
+    if show_scale_bar is not None:
+        out["showScaleBar"] = bool(show_scale_bar)
+    for key, value in (("gpuMemoryLimit", gpu_memory_limit),
+                       ("systemMemoryLimit", system_memory_limit),
+                       ("concurrentDownloads", concurrent_downloads)):
+        if value is not None:
+            out[key] = int(value)
+    # A tool palette is UI, and it names layers — which a split will have emptied. Nothing
+    # renders from it, and leaving it in a frame state is one more thing to go stale.
+    out.pop("toolPalettes", None)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# frames on disk
+# --------------------------------------------------------------------------- #
+def frame_path(out_dir: str, index: int, pattern: str = "frame_%05d.png") -> str:
+    """``<out_dir>/frame_00042.png``. ``pattern`` must be usable verbatim by ``ffmpeg -i``."""
+    try:
+        name = pattern % index
+    except TypeError:
+        raise RenderProblem(
+            f"frame pattern {pattern!r} has no integer field; ffmpeg reads a sequence through "
+            f"one, so it needs something like 'frame_%05d.png'") from None
+    return os.path.join(out_dir, name)
+
+
+def is_written(path: str) -> bool:
+    """True only for a file that exists **and begins with the PNG signature**.
+
+    A frame killed mid-write exists and is zero or half length. Treating it as done leaves one
+    corrupt frame in the middle of a sequence, which nothing notices until the encode — or
+    worse, does not fail the encode and simply shows a torn frame.
+    """
+    try:
+        with open(path, "rb") as f:
+            return f.read(len(PNG_MAGIC)) == PNG_MAGIC
+    except OSError:
+        return False
+
+
+def _write_atomic(path: str, data: bytes) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def pending_frames(timeline: Timeline, out_dir: str, *, resume: bool = True,
+                   start_frame: int = 0, end_frame: int | None = None,
+                   pattern: str = "frame_%05d.png") -> list[tuple[int, float, str]]:
+    """``(index, seconds, path)`` for the frames still to render. States are built later.
+
+    The state dicts are deliberately not built here: a long timeline is thousands of full
+    states, and holding them all costs far more than recomputing one per frame.
+    """
+    stop = timeline.frame_count if end_frame is None else min(end_frame, timeline.frame_count)
+    out = []
+    for i in range(max(0, start_frame), stop):
+        path = frame_path(out_dir, i, pattern)
+        if resume and is_written(path):
+            continue
+        out.append((i, i / timeline.fps, path))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# the browser
+# --------------------------------------------------------------------------- #
+def open_viewer(*, bind: str | None = None, port: int = 0):
+    """A viewer for a browser to attach to. Returns it; its ``.get_viewer_url()`` is the link.
+
+    ``bind`` and ``port`` **take effect only before the first viewer in the process**, the
+    same once-only constraint :func:`neu_glance.serve` documents — neuroglancer keeps them in
+    a module global read at server start. ``bind="0.0.0.0"`` makes the URL use the host's
+    FQDN, which is what a browser on another machine needs.
+    """
+    ng = _neuroglancer()
+    if bind is not None or port:
+        if ng.server.is_server_running():
+            print(f"a viewer server is already running in this process, so bind={bind!r} "
+                  f"port={port!r} are ignored — neuroglancer reads them once, at server start",
+                  file=sys.stderr)
+        else:
+            ng.set_server_bind_address(bind or "127.0.0.1", port)
+    return ng.Viewer()
+
+
+def wait_for_browser(viewer, state: Mapping[str, Any], *, timeout: float = 600.0,
+                     notify_every: float = 15.0, stall_timeout: float = 180.0) -> None:
+    """Push ``state``, then block until a browser has it open and loaded.
+
+    Without this the first real frame simply sits there: ``capture_screenshots`` pushes a
+    state and waits, and an unopened viewer is indistinguishable from a slow one until the
+    refresh timeout fires with a message about the browser being unresponsive.
+
+    **``state`` is required, and that is the whole lesson.** A screenshot reply proves a
+    browser is attached, so an empty viewer looks like the cheapest possible probe — nothing
+    to load, instant answer. It is the opposite: the client's ``maybeSendScreenshot`` bails
+    out with ``if (!viewer.isReady() && !force) { sendStatistics(); return; }``, and a viewer
+    holding **no layers and no dimensions never becomes ready**. Measured against a real
+    headless browser: an empty viewer produced 44 statistics messages and no reply in 45 s,
+    while the same viewer answered in 0.1 s once any state was pushed. Requiring the argument
+    is what stops that being rediscovered.
+
+    Two signals, and they mean different things:
+
+    - **the first statistics message means a browser is attached** — statistics travel the
+      same ``POST /action/<token>`` channel a reply does, so one arriving is proof the client
+      can reach the server. Only the absence of *any* signal is a connection problem;
+    - **the reply means the scene is loaded**, which is worth waiting for here because it is
+      the cost of the first frame either way.
+
+    So ``timeout`` bounds the wait for a browser, and after that ``stall_timeout`` bounds
+    silence rather than slowness — the same distinction ``capture_screenshots`` draws, and for
+    the same reason: to a wall clock a slow frame and a dead browser look identical.
+
+    **This touches no config, deliberately.** The probe used to ask for 64x64 to be cheap.
+    ``viewerSize`` sets the container's CSS width and height and then scales it to fill the
+    window (``transform: scale(min(clientWidth / w, clientHeight / h))``), so a 64x64 viewer in
+    a 1900px window is neuroglancer's own UI magnified thirty times: blocky panel borders and
+    letters a foot high. Whoever opened that link reasonably concluded the data was broken.
+    """
+    url = viewer.get_viewer_url()
+    print(f"open this in a browser and leave it open:\n    {url}", file=sys.stderr)
+    viewer.set_state(dict(state))
+
+    attached, loaded = threading.Event(), threading.Event()
+    progress: dict[str, Any] = {"at": time.monotonic(), "loaded": 0, "total": 0}
+
+    def on_statistics(statistics):
+        attached.set()
+        total = statistics.total
+        progress.update(at=time.monotonic(),
+                        loaded=total.visible_chunks_gpu_memory,
+                        total=total.visible_chunks_total,
+                        downloading=total.visible_chunks_downloading)
+
+    def on_reply(_reply):
+        attached.set()
+        loaded.set()
+
+    viewer.async_screenshot(on_reply, statistics_callback=on_statistics)
+
+    waited = 0.0
+    while not loaded.wait(max(0.1, notify_every)):
+        waited += notify_every
+        if not attached.is_set():
+            if waited >= timeout:
+                hint = ("\n    The viewer is bound to loopback, so only a browser on this "
+                        "machine can reach it — pass bind='0.0.0.0' or forward the port."
+                        if "localhost" in url or "127.0.0.1" in url else "")
+                raise RenderProblem(f"no browser attached after {timeout:g}s.\n    {url}{hint}")
+            print(f"still waiting for a browser ({waited:g}s):\n    {url}", file=sys.stderr)
+            continue
+        silent = time.monotonic() - progress["at"]
+        if silent >= stall_timeout:
+            raise RenderProblem(
+                f"a browser is attached but has sent nothing for {silent:.0f}s while loading "
+                f"the opening frame ({progress['loaded']}/{progress['total']} chunks). Reload "
+                f"the tab and re-run — nothing has been written yet")
+        print(f"browser attached; loading the opening frame — "
+              f"{progress['loaded']}/{progress['total']} chunks "
+              f"({progress.get('downloading', 0)} downloading)", file=sys.stderr)
+    print("scene loaded; rendering", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- #
+# the render
+# --------------------------------------------------------------------------- #
+class _RequestQueue:
+    """Feeds :func:`capture_screenshots`, and can put a frame back.
+
+    A frame comes back when the reply is the wrong size. That is transient rather than fatal —
+    ``Viewer.screenshot`` retries five times for the same reason — but ``async_screenshot``,
+    which the capture loop uses, does not retry at all. So the retry lives here.
+    """
+
+    def __init__(self, timeline, items, *, size, attempts, request_type, on_write=None):
+        self.timeline = timeline
+        self.queue = deque(items)
+        self.size = size
+        self.attempts = attempts
+        self.request_type = request_type
+        self.on_write = on_write
+        self.tries: dict[int, int] = {}
+        self.written: list[str] = []
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self.queue:
+            raise StopIteration
+        index, seconds, path = self.queue.popleft()
+        width, height = self.size
+
+        def config_callback(s):
+            s.viewer_size = (width, height)
+
+        def response_callback(reply):
+            if (reply.width, reply.height) != (width, height):
+                self.tries[index] = self.tries.get(index, 0) + 1
+                if self.tries[index] > self.attempts:
+                    raise RenderProblem(
+                        f"frame {index} came back {reply.width}x{reply.height} instead of "
+                        f"{width}x{height}, {self.attempts} times running. The browser window "
+                        f"is probably smaller than the requested size — enlarge it, or render "
+                        f"smaller. Frames already written are kept; re-run to resume")
+                print(f"frame {index}: got {reply.width}x{reply.height}, wanted "
+                      f"{width}x{height} — requeued", file=sys.stderr)
+                self.queue.appendleft((index, seconds, path))
+                return
+            _write_atomic(path, reply.image)
+            self.written.append(path)
+            if self.on_write is not None:
+                self.on_write(path)
+
+        return self.request_type(
+            state=self.timeline.at(seconds),
+            description=f"frame {index} @ {seconds:.3f}s",
+            config_callback=config_callback,
+            response_callback=response_callback)
+
+
+def record(timeline: Timeline, out_dir: str, *, size: tuple[int, int] = (1920, 1080),
+           viewer=None, bind: str | None = None, port: int = 0,
+           prefetch: int = 1, refresh_timeout: float = 120.0, give_up_after: int = 5,
+           connect_timeout: float = 600.0, size_attempts: int = 5,
+           resume: bool = True, start_frame: int = 0, end_frame: int | None = None,
+           pattern: str = "frame_%05d.png", shape: bool = True,
+           verbose: bool = False, progress_interval: float = 10.0) -> list[str]:
+    """Render ``timeline`` into ``out_dir``. Returns the frame paths written this run.
+
+    ``verbose=True`` prints the capture loop's own line per frame and per statistics message;
+    the default shows a progress bar (or periodic lines with an ETA where tqdm is not
+    installed) and keeps only the last few of those, printing them if the render fails.
+
+    Writes ``timeline.json`` beside the frames, so the sequence describes itself and the
+    timings can be edited and re-rendered without re-deriving them.
+
+    Interrupting at any point is safe — every written frame is complete — and re-running
+    resumes. ``start_frame``/``end_frame`` render a slice with the *same* numbering, so a fade
+    section at one frame rate and a camera move at another can share a directory.
+    """
+    _neuroglancer()          # fail on the missing extra before anything else, as `serve` does
+    from neuroglancer.tool.screenshot import CaptureScreenshotRequest, capture_screenshots
+
+    width, height = (int(v) for v in size)
+    for label, value in (("width", width), ("height", height)):
+        if value % 2:
+            raise RenderProblem(
+                f"{label} must be even ({value} is not): libx264 with the yuv420p pixel "
+                f"format needs even dimensions, and the error it gives otherwise is unhelpful")
+
+    os.makedirs(out_dir, exist_ok=True)
+    for note in timeline.check():
+        print(note, file=sys.stderr)
+
+    shaped = timeline
+    if shape:
+        shaped = Timeline(base=render_state(timeline.base), fps=timeline.fps,
+                          tweens=list(timeline.tweens), groups=dict(timeline.groups),
+                          cursor=timeline.cursor)
+        shaped.duration = timeline.duration
+
+    todo = pending_frames(shaped, out_dir, resume=resume, start_frame=start_frame,
+                          end_frame=end_frame, pattern=pattern)
+    total = shaped.frame_count if end_frame is None else end_frame - start_frame
+    _write_atomic(os.path.join(out_dir, "timeline.json"),
+                  json.dumps(shaped.to_json(), indent=2).encode())
+    print(f"{shaped.duration:g}s at {shaped.fps:g} fps = {shaped.frame_count} frames at "
+          f"{width}x{height}; {len(todo)} to render"
+          + (f" ({total - len(todo)} already present)" if resume and total > len(todo) else ""),
+          file=sys.stderr)
+    if not todo:
+        print_encode_hint(out_dir, shaped.fps, pattern=pattern)
+        return []
+
+    # The opening frame, shown the moment someone is watching rather than a blank viewer that
+    # gives no sign the run is alive — and it is what makes the viewer READY, without which no
+    # screenshot request is ever answered. It also starts every mesh loading now instead of
+    # inside the first capture, which is the slow one either way.
+    opening = shaped.at(todo[0][1])
+    if viewer is None:
+        viewer = open_viewer(bind=bind, port=port)
+        wait_for_browser(viewer, opening, timeout=connect_timeout)
+    else:
+        viewer.set_state(opening)
+
+    refreshes = {"n": 0}
+
+    def refresh_browser_callback():
+        refreshes["n"] += 1
+        if refreshes["n"] > give_up_after:
+            raise RenderProblem(
+                f"the browser sent no progress for {refresh_timeout:g}s, {give_up_after} times "
+                f"running. Frames already written are kept — reload {viewer.get_viewer_url()} "
+                f"and re-run to resume")
+        print(f"no progress for {refresh_timeout:g}s ({refreshes['n']}/{give_up_after}) — "
+              f"reload the tab if it has stopped responding", file=sys.stderr)
+
+    progress = _Progress(len(todo), verbose=verbose, min_interval=progress_interval,
+                         description=f"rendering {width}x{height}")
+    queue = _RequestQueue(shaped, todo, size=(width, height), attempts=size_attempts,
+                          request_type=CaptureScreenshotRequest, on_write=progress.advance)
+
+    # `capture_screenshots` reports on stdout, where this package puts only payload — and its
+    # statistics callback runs on the tornado thread, so the redirect has to be held for the
+    # whole render rather than around each call.
+    #
+    # Where it goes depends on `verbose`, and quiet mode SWALLOWS rather than forwards. A
+    # progress bar owns the terminal: tqdm writes `\r` with no newline, so anything else
+    # printing meanwhile lands on the same line (`NOTES-neu-mark.md` records exactly this
+    # against neuclease's bars). The last few lines are kept and printed if the render fails,
+    # so quiet never means losing the evidence.
+    tail = _Tail()
+    try:
+        with contextlib.redirect_stdout(sys.stderr if verbose else tail):
+            capture_screenshots(viewer, iter(queue), refresh_browser_callback,
+                                refresh_timeout, num_to_prefetch=prefetch)
+    except BaseException:
+        progress.close()
+        if tail.lines:
+            print("\n--- last lines from the capture loop ---", file=sys.stderr)
+            for line in tail.lines:
+                print(f"    {line}", file=sys.stderr)
+        raise
+    finally:
+        progress.close()
+        # Hand the tab back as an ordinary viewer. A `viewerSize` left set keeps the container
+        # at a fixed pixel size and CSS-scaled to fit the window, which at any size but the
+        # window's own looks like a rendering fault rather than a leftover setting. `None`
+        # restores the responsive layout.
+        with contextlib.suppress(Exception):
+            with viewer.config_state.txn() as s:
+                s.viewer_size = None
+                s.show_ui_controls = True
+
+    print(f"wrote {len(queue.written)} frame(s) to {out_dir}", file=sys.stderr)
+    print_encode_hint(out_dir, shaped.fps, pattern=pattern)
+    return queue.written
+
+
+def print_encode_hint(out_dir: str, fps: float, *, pattern: str = "frame_%05d.png",
+                      file=None) -> None:
+    """Say, unmistakably, that the frames are frames and the encode is the reader's to run.
+
+    The command on its own is ambiguous in the worst way: printed among progress lines with no
+    verb in front of it, it reads as a report of something that already happened, and the
+    obvious conclusion on finding no ``.mp4`` is that the encode failed. It did not run.
+    """
+    print(f"\nRendering is done — the output is a directory of PNG frames.\n"
+          f"NOTHING HAS BEEN ENCODED: run this yourself to get a video.\n"
+          f"(ffmpeg is often not on PATH — on a cluster it is usually a module.)\n\n"
+          f"    {ffmpeg_command(out_dir, fps, pattern=pattern)}\n",
+          file=file or sys.stderr)
+
+
+def ffmpeg_command(out_dir: str, fps: float, *, output: str | None = None, crf: int = 18,
+                   pattern: str = "frame_%05d.png") -> str:
+    """The command that turns the frames into an mp4. Printed, never run.
+
+    **Not run** because ``ffmpeg`` is very often not on ``PATH`` — on an HPC site it is a
+    module, and ``module`` is a shell function rather than an executable, so there is no
+    portable way to reach it from here. Separating the two is also just better: a render takes
+    hours and an encode takes seconds, so a failed encode should cost nothing, and re-encoding
+    at a different quality should not mean re-rendering.
+
+    ``-pix_fmt yuv420p`` is not optional. Without it the file encodes perfectly and then will
+    not play in QuickTime, PowerPoint or Slack, which is a discovery to make now rather than
+    in front of an audience.
+    """
+    dest = output or os.path.join(out_dir, "animation.mp4")
+    return (f"ffmpeg -y -framerate {fps:g} -i {os.path.join(out_dir, pattern)} "
+            f"-c:v libx264 -pix_fmt yuv420p -crf {crf} {dest}")

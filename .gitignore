@@ -20,3 +20,9 @@ dist/
 # Generated states and links are one person's view of one dataset, not the package's.
 *.state.json
 *.layer.json
+
+# Rendered animations. The frames are large and the timeline beside them embeds the base
+# state, source URLs and all — a run artefact, exactly like the two above.
+/frames/
+*.timeline.json
+timeline.json
