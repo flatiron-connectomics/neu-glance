@@ -97,12 +97,16 @@ class _FakeViewer:
 
     def async_screenshot(self, callback, include_depth=False, statistics_callback=None):
         self.probes += 1
+        # `answers` may be a count: the two-stage wait probes once to prove attachment and
+        # again for the loaded scene, and those fail differently.
+        answers = (self.probes <= self.answers if isinstance(self.answers, int)
+                   and not isinstance(self.answers, bool) else self.answers)
         for loaded, total, downloading in self.statistics:
             if statistics_callback is not None:
                 statistics_callback(SimpleNamespace(total=SimpleNamespace(
                     visible_chunks_gpu_memory=loaded, visible_chunks_total=total,
                     visible_chunks_downloading=downloading)))
-        if not self.answers:
+        if not answers:
             return
         size = self.reply_size or self.config.viewer_size or (64, 64)
         callback(SimpleNamespace(screenshot=_Reply(*size)))
@@ -386,18 +390,21 @@ def test_the_state_is_shaped_ONCE_before_interpolation_not_per_frame(tmp_path):
 def test_the_probe_PUSHES_A_STATE_because_an_empty_viewer_is_never_ready(tmp_path):
     """The trap this exists to prevent, measured against a real headless browser.
 
-    A screenshot reply proves a browser is attached, so probing an empty viewer looks like the
-    cheapest possible check — no layers, nothing to load, instant answer. It is the opposite:
-    the client's `maybeSendScreenshot` bails with `if (!viewer.isReady() && !force) { ... }`,
-    and a viewer holding no layers and no dimensions never becomes ready. Measured: an empty
-    viewer gave 44 statistics messages and NO reply in 45s; the same viewer answered in 0.1s
-    once any state was pushed. Requiring `state` is what stops that coming back.
+    A screenshot reply proves a browser is attached, so probing a viewer holding NOTHING looks
+    like the cheapest possible check. It is the opposite: the client's `maybeSendScreenshot`
+    bails with `if (!viewer.isReady() && !force) { ... }`, and a viewer with no layers AND no
+    dimensions never becomes ready. Measured: 44 statistics messages and no reply in 45s;
+    0.1s once any state was pushed. So the attach probe pushes an empty-but-VALID state —
+    dimensions, no layers — which is ready at once, and the real scene follows.
     """
     viewer = _FakeViewer()
     state = _state()
     wait_for_browser(viewer, state)
-    assert viewer.states == [state], "the state must be pushed before the probe"
-    assert viewer.probes == 1
+    assert len(viewer.states) == 2, "an attach probe, then the real scene"
+    probe, real = viewer.states
+    assert probe["layers"] == [] and probe["dimensions"] == state["dimensions"]
+    assert real == state
+    assert viewer.probes == 2
 
 
 def test_waiting_for_a_browser_changes_NOTHING_about_the_viewers_config():
@@ -432,22 +439,24 @@ def test_the_bind_hint_is_omitted_when_the_url_already_names_a_host():
     assert "loopback" not in str(excinfo.value)
 
 
-def test_STATISTICS_alone_prove_a_browser_is_attached_so_slow_is_not_disconnected():
-    """Statistics travel the same POST /action channel a reply does.
+def test_A_SLOW_SCENE_IS_NOT_REPORTED_AS_A_MISSING_BROWSER():
+    """The two questions are separated because a big scene made them look like one.
 
-    So one arriving is proof the client can reach the server, and a scene that is merely slow
-    to load must not be reported as a browser that never showed up — which is what sent the
-    first diagnosis of this chasing a network problem that did not exist.
+    Waiting for the REAL scene to prove attachment means several hundred meshes' worth of
+    loading is indistinguishable from a browser that never started, and the run prints
+    `still waiting for a browser` for a minute while it is working hard. The attach probe
+    answers (first call); only the scene is slow.
     """
-    viewer = _FakeViewer(answers=False, statistics=[(300, 1900, 12)])
+    viewer = _FakeViewer(answers=1, statistics=[(300, 1900, 12)])
     with pytest.raises(RenderProblem, match="has sent nothing for") as excinfo:
-        wait_for_browser(viewer, _state(), timeout=0.2, notify_every=0.1, stall_timeout=0.25)
+        wait_for_browser(viewer, _state(), timeout=5.0, notify_every=0.1, stall_timeout=0.25)
     assert "300/1900" in str(excinfo.value)
     assert "no browser attached" not in str(excinfo.value)
 
 
 def test_loading_progress_is_reported_rather_than_a_bare_wait(capsys):
-    viewer = _FakeViewer(answers=False, statistics=[(300, 1900, 12)])
+    """"Loading 300/1900 chunks" is a working render; a bare wait looks like a hang."""
+    viewer = _FakeViewer(answers=1, statistics=[(300, 1900, 12)])
     with pytest.raises(RenderProblem):
         wait_for_browser(viewer, _state(), timeout=5.0, notify_every=0.1, stall_timeout=0.25)
     err = capsys.readouterr().err

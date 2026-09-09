@@ -360,6 +360,18 @@ def headless_browser(url: str, *, size: tuple[int, int] = (1920, 1080),
         shutil.rmtree(profile, ignore_errors=True)
 
 
+def _await_reply(viewer, *, timeout, notify_every, message, on_timeout):
+    """Block on one screenshot reply, reporting periodically. Raises what `on_timeout` builds."""
+    ready = threading.Event()
+    viewer.async_screenshot(lambda _reply: ready.set())
+    waited = 0.0
+    while not ready.wait(max(0.1, notify_every)):
+        waited += notify_every
+        if waited >= timeout:
+            raise on_timeout()
+        print(f"{message} ({waited:g}s)", file=sys.stderr)
+
+
 def wait_for_browser(viewer, state: Mapping[str, Any], *, timeout: float = 600.0,
                      notify_every: float = 15.0, stall_timeout: float = 180.0,
                      launched: bool = False) -> None:
@@ -404,12 +416,33 @@ def wait_for_browser(viewer, state: Mapping[str, Any], *, timeout: float = 600.0
     """
     url = viewer.get_viewer_url()
     if launched:
-        print(f"waiting for the headless browser to load the scene\n    {url}",
-              file=sys.stderr)
+        print(f"waiting for the headless browser\n    {url}", file=sys.stderr)
     else:
         print(f"open this in a browser and leave it open:\n    {url}", file=sys.stderr)
-    viewer.set_state(dict(state))
 
+    # **Attachment is proved against an EMPTY-BUT-VALID state, not the real scene.** A
+    # screenshot reply needs the viewer to be ready, and a scene of several hundred meshes is
+    # not ready for a long time — so waiting for the real one conflates "no browser" with "a
+    # browser working hard", and prints `still waiting for a browser` for a minute while it
+    # loads. A state with dimensions and no layers is ready almost at once (measured: 0.1 s),
+    # which separates the two questions.
+    empty = {"dimensions": state.get("dimensions") or {}, "layers": [],
+             "layout": state.get("layout", "3d")}
+    viewer.set_state(empty)
+    _await_reply(viewer, timeout=timeout, notify_every=notify_every,
+                 message=(f"still waiting for {'the headless browser' if launched else 'a browser'}"
+                          + ("" if launched else f":\n    {url}")),
+                 on_timeout=lambda: RenderProblem(
+                     f"no browser attached after {timeout:g}s.\n    {url}" + (
+                         "\n    The browser was started here, so it has died or cannot reach "
+                         "the viewer port. Try browser='none' to open one yourself, or "
+                         "gpu=False if the GPU flags are not supported." if launched else
+                         "\n    The viewer is bound to loopback, so only a browser on this "
+                         "machine can reach it — pass bind='0.0.0.0' or forward the port."
+                         if "localhost" in url or "127.0.0.1" in url else "")))
+    print("browser attached; loading the scene", file=sys.stderr)
+
+    viewer.set_state(dict(state))
     attached, loaded = threading.Event(), threading.Event()
     progress: dict[str, Any] = {"at": time.monotonic(), "loaded": 0, "total": 0}
 
@@ -430,30 +463,18 @@ def wait_for_browser(viewer, state: Mapping[str, Any], *, timeout: float = 600.0
     waited = 0.0
     while not loaded.wait(max(0.1, notify_every)):
         waited += notify_every
-        if not attached.is_set():
-            if waited >= timeout:
-                if launched:
-                    hint = ("\n    The browser was started here, so it has died or cannot "
-                            "reach the viewer port. Try browser='none' to open one yourself, "
-                            "or gpu=False if the GPU flags are not supported.")
-                elif "localhost" in url or "127.0.0.1" in url:
-                    hint = ("\n    The viewer is bound to loopback, so only a browser on this "
-                            "machine can reach it — pass bind='0.0.0.0' or forward the port.")
-                else:
-                    hint = ""
-                raise RenderProblem(f"no browser attached after {timeout:g}s.\n    {url}{hint}")
-            print(f"still waiting for {'the headless browser' if launched else 'a browser'} "
-                  f"({waited:g}s)" + ("" if launched else f":\n    {url}"), file=sys.stderr)
-            continue
         silent = time.monotonic() - progress["at"]
-        if silent >= stall_timeout:
+        if attached.is_set() and silent >= stall_timeout:
             raise RenderProblem(
-                f"a browser is attached but has sent nothing for {silent:.0f}s while loading "
-                f"the opening frame ({progress['loaded']}/{progress['total']} chunks). Reload "
-                f"the tab and re-run — nothing has been written yet")
-        print(f"browser attached; loading the opening frame — "
-              f"{progress['loaded']}/{progress['total']} chunks "
-              f"({progress.get('downloading', 0)} downloading)", file=sys.stderr)
+                f"the browser has sent nothing for {silent:.0f}s while loading the opening "
+                f"frame ({progress['loaded']}/{progress['total']} chunks). Reload and re-run "
+                f"— nothing has been written yet")
+        if progress["total"]:
+            print(f"  loading: {progress['loaded']}/{progress['total']} chunks "
+                  f"({progress.get('downloading', 0)} downloading, {waited:g}s)",
+                  file=sys.stderr)
+        else:
+            print(f"  loading the scene ({waited:g}s)", file=sys.stderr)
     print("scene loaded; rendering", file=sys.stderr)
 
 
