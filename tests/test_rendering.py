@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from types import SimpleNamespace
 
 import pytest
@@ -24,7 +25,8 @@ pytest.importorskip("neuroglancer", reason="the serve extra is not installed")
 from neu_glance.rendering import (  # noqa: E402
     CHROME_OFF, PNG_MAGIC, RenderProblem, _RequestQueue, _Tail, _write_atomic,
     ffmpeg_command, frame_path, is_written, pending_frames, print_encode_hint, record,
-    render_state, stale_frames, wait_for_browser)
+    render_state, stale_frames, wait_for_browser,
+    BROWSERS, GPU_FLAGS, find_browser, headless_browser)
 
 
 def _state(**extra):
@@ -609,3 +611,96 @@ def test_every_neuroglancer_import_in_the_package_is_DEFERRED():
             (deferred if line[0] in " \t" else offenders).append(f"{name}:{lineno}")
     assert offenders == [], f"neuroglancer imported at module scope in {offenders}"
     assert deferred, "nothing imports neuroglancer any more — has the gate moved?"
+
+
+# --------------------------------------------------------------------------- #
+# launching a browser
+# --------------------------------------------------------------------------- #
+def test_finding_a_browser_prefers_an_explicit_binary_over_the_search(tmp_path):
+    fake = tmp_path / "my-chrome"
+    fake.write_text("#!/bin/sh\n")
+    assert find_browser(str(fake)) == str(fake)
+    assert find_browser("definitely-not-a-browser-anywhere") is None
+
+
+def test_the_headless_launcher_needs_NO_selenium():
+    """The realisation this whole path rests on. `neuroglancer.webdriver` uses selenium, so
+    headless looked like it required selenium plus a matching chromedriver — but selenium is
+    for *controlling* a page, and nothing here controls one. State changes and screenshot
+    replies travel the viewer's own channel; the browser only has to stay loaded."""
+    code = ("import neu_glance.rendering as r, sys; "
+            "r.find_browser('nope'); "
+            "assert 'selenium' not in sys.modules")
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_the_launcher_cleans_up_its_throwaway_profile(tmp_path):
+    """Without --user-data-dir a second render collides with the first's profile lock and
+    attaches to the running instance, which then never loads the second viewer. The directory
+    is per-render, so it has to go afterwards or they accumulate."""
+    before = set(os.listdir(tempfile.gettempdir()))
+    with headless_browser("http://localhost:1/v/x/", size=(64, 64), binary="/bin/sleep",
+                          gpu=False) as process:
+        assert process.pid > 0
+    new = [n for n in set(os.listdir(tempfile.gettempdir())) - before
+           if n.startswith("neu-glance-render-")]
+    assert new == []
+
+
+def test_the_launcher_sizes_the_window_to_the_RENDER(monkeypatch):
+    """`viewerSize` scales its container to fit the window, so a window smaller than the frame
+    means every screenshot comes back the wrong size and every frame is requeued."""
+    seen = {}
+
+    class _Fake:
+        def __init__(self, command, **kw):
+            seen["command"] = command
+            self.pid = 1
+
+        def terminate(self): pass
+
+        def wait(self, timeout=None): return 0
+
+    monkeypatch.setattr(subprocess, "Popen", _Fake)
+    with headless_browser("http://x/", size=(1280, 720), binary="/bin/true"):
+        pass
+    assert "--window-size=1280,720" in seen["command"]
+    assert seen["command"][-1] == "http://x/"
+
+
+def test_the_gpu_flags_are_ON_by_default_because_software_rendering_is_10x_slower(monkeypatch):
+    """Measured on one 1920x1080 mesh scene: 2.17 s/frame with SwiftShader, 0.21 with these.
+    A render that silently falls back is a render that takes all afternoon and looks fine."""
+    seen = {}
+
+    class _Fake:
+        def __init__(self, command, **kw):
+            seen["command"] = command
+            self.pid = 1
+
+        def terminate(self): pass
+
+        def wait(self, timeout=None): return 0
+
+    monkeypatch.setattr(subprocess, "Popen", _Fake)
+    with headless_browser("http://x/", size=(64, 64), binary="/bin/true"):
+        pass
+    assert all(flag in seen["command"] for flag in GPU_FLAGS)
+
+
+def test_an_unknown_browser_mode_is_refused(tmp_path):
+    with pytest.raises(RenderProblem, match="'auto', 'headless' or 'none'"):
+        record(_timeline(), str(tmp_path), size=(64, 32), browser="chrome-ish")
+
+
+def test_insisting_on_headless_with_none_installed_names_the_alternative(tmp_path):
+    with pytest.raises(RenderProblem, match="browser='none'"):
+        record(_timeline(), str(tmp_path), size=(64, 32), browser="headless",
+               browser_binary="definitely-not-a-browser-anywhere")
+
+
+def test_a_caller_supplying_its_own_viewer_launches_nothing(tmp_path, monkeypatch):
+    """The spike scripts drive one viewer across several renders; launching a browser per
+    call would leave one running per render."""
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("launched a browser"))
+    assert record(_timeline(), str(tmp_path), size=(64, 32), viewer=_FakeViewer())

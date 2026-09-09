@@ -5,10 +5,19 @@ client loads whatever chunks that state makes visible, draws, and posts the imag
 :mod:`neu_glance.animate` decides *what* each frame is; this module is the part that needs a
 browser, and it is deliberately the smaller half.
 
-**A browser you open yourself is the default.** ``neuroglancer.webdriver`` can drive a
-headless Chrome, but it needs selenium and a matching chromedriver, and neither is a given.
-:func:`record` starts a viewer, prints its URL and waits for you to open it — which needs
-nothing installed beyond ``neu-glance[serve]`` and works the first time.
+**A headless browser is the default, and it needs no selenium.** That was not obvious and
+cost a while to notice: ``neuroglancer.webdriver`` uses selenium, so the headless path looked
+like it required selenium plus a matching chromedriver. It does not. Selenium exists to
+*control* a page, and nothing here controls one — every state change and every screenshot
+reply travels the viewer's own channel, so the browser's entire job is to load a URL and stay
+loaded. That is ``subprocess.Popen``. See :func:`headless_browser`.
+
+It is also **faster than a browser on a desk**, which is the opposite of what one expects
+from "software rendering, no window". Measured on one 1920x1080 mesh scene: 0.21 s/frame
+headless on the local GPU, against 0.57 s/frame through a browser on another machine, which
+pays a network round trip per frame. Headless without :data:`GPU_FLAGS` is 2.17 s/frame, so
+those flags are most of it. ``record(..., browser="none")`` still prints a URL and waits, for
+a machine with no browser installed or when you want to watch it work.
 
 **Every neuroglancer import here is deferred**, inside the function that needs it, and the
 missing-extra error comes from :func:`neu_glance.serving._neuroglancer` so there is one
@@ -37,11 +46,14 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .animate import Timeline
 from .serving import _neuroglancer
@@ -278,6 +290,76 @@ def open_viewer(*, bind: str | None = None, port: int = 0):
     return ng.Viewer()
 
 
+#: Browser binaries to look for, in preference order.
+BROWSERS = ("google-chrome", "google-chrome-stable", "chromium-browser", "chromium")
+
+#: Flags that put WebGL on a real GPU instead of the software rasteriser.
+#:
+#: **This is the difference between a render and an afternoon.** Headless Chrome defaults to
+#: SwiftShader, which draws correctly and slowly; measured on one 1920x1080 mesh scene:
+#: 2.17 s/frame by default, **0.21 s/frame** with these. That is also 2.7x faster than the
+#: same scene through a browser on someone's desk, which pays a round trip per frame.
+GPU_FLAGS = ("--use-angle=vulkan", "--enable-features=Vulkan", "--enable-gpu",
+             "--ignore-gpu-blocklist")
+
+#: Flags that make Chrome survive being run headless as an ordinary user on a shared machine.
+HEADLESS_FLAGS = ("--headless=new", "--no-sandbox", "--disable-dev-shm-usage",
+                  "--disable-extensions", "--mute-audio")
+
+
+def find_browser(binary: str | None = None) -> str | None:
+    """A chrome/chromium executable, or ``None``. ``binary`` overrides the search."""
+    if binary:
+        return binary if os.path.exists(binary) else shutil.which(binary)
+    for name in BROWSERS:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+@contextlib.contextmanager
+def headless_browser(url: str, *, size: tuple[int, int] = (1920, 1080),
+                     binary: str | None = None, gpu: bool = True,
+                     extra_args: Sequence[str] = ()):
+    """Run a browser on ``url`` for the duration of the block, with no window and no tab.
+
+    **No selenium and no chromedriver.** Those exist to *control* a page; nothing here
+    controls it. The viewer's own channel carries every state change and every screenshot
+    reply, so all the browser has to do is load the URL and stay loaded — which is
+    ``subprocess.Popen``. Believing otherwise is what kept this an attended process for
+    longer than it needed to be.
+
+    The window is sized to the render, since ``viewerSize`` scales its container to fit and a
+    window smaller than the frame means every screenshot comes back the wrong size.
+
+    The profile is a throwaway directory, removed on the way out: without ``--user-data-dir``
+    a second render collides with the first's profile lock and simply attaches to the running
+    instance, which then never loads the second viewer.
+    """
+    executable = find_browser(binary)
+    if executable is None:
+        raise RenderProblem(
+            f"no browser found (looked for {', '.join(BROWSERS)}). Pass binary=..., or render "
+            f"attended by opening the viewer URL yourself — `record(..., browser='none')`.")
+    profile = tempfile.mkdtemp(prefix="neu-glance-render-")
+    command = [executable, *HEADLESS_FLAGS, f"--user-data-dir={profile}",
+               f"--window-size={size[0]},{size[1]}", *(GPU_FLAGS if gpu else ()),
+               *extra_args, url]
+    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"launched {os.path.basename(executable)} headless"
+          f"{' on the GPU' if gpu else ' (software rendering)'}", file=sys.stderr)
+    try:
+        yield process
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:                       # pragma: no cover
+            process.kill()
+        shutil.rmtree(profile, ignore_errors=True)
+
+
 def wait_for_browser(viewer, state: Mapping[str, Any], *, timeout: float = 600.0,
                      notify_every: float = 15.0, stall_timeout: float = 180.0) -> None:
     """Push ``state``, then block until a browser has it open and loaded.
@@ -421,12 +503,21 @@ def record(timeline: Timeline, out_dir: str, *, size: tuple[int, int] = (1920, 1
            connect_timeout: float = 600.0, size_attempts: int = 5,
            resume: bool = True, start_frame: int = 0, end_frame: int | None = None,
            pattern: str = "frame_%05d.png", shape: bool = True,
-           verbose: bool = False, progress_interval: float = 10.0) -> list[str]:
+           verbose: bool = False, progress_interval: float = 10.0,
+           browser: str = "auto", browser_binary: str | None = None,
+           gpu: bool = True) -> list[str]:
     """Render ``timeline`` into ``out_dir``. Returns the frame paths written this run.
 
     ``verbose=True`` prints the capture loop's own line per frame and per statistics message;
     the default shows a progress bar (or periodic lines with an ETA where tqdm is not
     installed) and keeps only the last few of those, printing them if the render fails.
+
+    ``browser`` decides who draws. ``"auto"`` (the default) runs a **headless** chrome or
+    chromium if one is on the PATH and falls back to printing a URL for you to open if not;
+    ``"headless"`` insists and raises if none is found; ``"none"`` always waits for you.
+    Headless is the default because it is both unattended and *faster* — measured on one
+    1920x1080 mesh scene, 0.21 s/frame against 0.57 s/frame through a browser on a desk
+    elsewhere, which pays a network round trip per frame. See :func:`headless_browser`.
 
     Writes ``timeline.json`` beside the frames, so the sequence describes itself and the
     timings can be edited and re-rendered without re-deriving them.
@@ -436,7 +527,6 @@ def record(timeline: Timeline, out_dir: str, *, size: tuple[int, int] = (1920, 1
     section at one frame rate and a camera move at another can share a directory.
     """
     _neuroglancer()          # fail on the missing extra before anything else, as `serve` does
-    from neuroglancer.tool.screenshot import CaptureScreenshotRequest, capture_screenshots
 
     width, height = (int(v) for v in size)
     for label, value in (("width", width), ("height", height)):
@@ -505,12 +595,39 @@ def record(timeline: Timeline, out_dir: str, *, size: tuple[int, int] = (1920, 1
     # screenshot request is ever answered. It also starts every mesh loading now instead of
     # inside the first capture, which is the slow one either way.
     opening = shaped.at(todo[0][1])
-    if viewer is None:
-        viewer = open_viewer(bind=bind, port=port)
-        wait_for_browser(viewer, opening, timeout=connect_timeout)
-    else:
-        viewer.set_state(opening)
+    capture = dict(shaped=shaped, todo=todo, out_dir=out_dir, size=(width, height),
+                   pattern=pattern, prefetch=prefetch, refresh_timeout=refresh_timeout,
+                   give_up_after=give_up_after, size_attempts=size_attempts,
+                   verbose=verbose, progress_interval=progress_interval)
 
+    if viewer is not None:                       # a caller driving its own viewer
+        viewer.set_state(opening)
+        return _capture(viewer, **capture)
+
+    if browser not in ("auto", "headless", "none"):
+        raise RenderProblem(f"browser must be 'auto', 'headless' or 'none', got {browser!r}")
+    executable = None if browser == "none" else find_browser(browser_binary)
+    if browser == "headless" and executable is None:
+        raise RenderProblem(
+            f"browser='headless' but none was found (looked for {', '.join(BROWSERS)}). Pass "
+            f"browser_binary=..., or browser='none' to open one yourself.")
+
+    viewer = open_viewer(bind=bind, port=port)
+    if executable is None:
+        wait_for_browser(viewer, opening, timeout=connect_timeout)
+        return _capture(viewer, **capture)
+    with headless_browser(viewer.get_viewer_url(), size=(width, height),
+                          binary=browser_binary, gpu=gpu):
+        wait_for_browser(viewer, opening, timeout=connect_timeout)
+        return _capture(viewer, **capture)
+
+
+def _capture(viewer, *, shaped, todo, out_dir, size, pattern, prefetch, refresh_timeout,
+             give_up_after, size_attempts, verbose, progress_interval) -> list[str]:
+    """The loop itself, once something is drawing. Shared by every browser arrangement."""
+    from neuroglancer.tool.screenshot import CaptureScreenshotRequest, capture_screenshots
+
+    width, height = size
     refreshes = {"n": 0}
 
     def refresh_browser_callback():
