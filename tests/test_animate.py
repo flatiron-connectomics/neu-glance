@@ -882,3 +882,33 @@ def test_timeline_sets_returns_the_layer_names_and_they_animate():
     assert _layer(tl.at(0.0), "KCs")["objectAlpha"] == pytest.approx(0.0)
     assert _layer(tl.at(2.0), "KCs")["objectAlpha"] == pytest.approx(1.0)
     assert _layer(tl.at(2.0), "KCs")["segmentDefaultColor"] == "#ffcc33"
+
+
+def test_rotation_safe_framing_fits_the_DIAGONAL_not_the_box():
+    """A box framed at one angle exceeds the frame at another as its long axis swings towards
+    the vertical. The bounding sphere is the only extent rotation cannot grow.
+
+    Measured on the real head mesh: framed on the box, 6 of 9 angles of a full turn clipped;
+    on the diagonal, 0 of 9. It costs size — the diagonal of that box is 1.5x its longest
+    axis, paid at every angle.
+    """
+    import math
+
+    tl = Timeline(_state(_seg("s", ["1"])), fps=10.0)
+    box = ((0.0, 0.0, 0.0), (300.0, 400.0, 1200.0))
+    tl.frame_on(box, at=0.0, seconds=1.0, units="voxels", margin=1.0)
+    plain = tl.at(1.0)["projectionScale"]
+
+    safe = Timeline(_state(_seg("s", ["1"])), fps=10.0)
+    safe.frame_on(box, at=0.0, seconds=1.0, units="voxels", margin=1.0, rotation_safe=True)
+    assert plain == pytest.approx(1200.0)                       # the longest axis
+    assert safe.at(1.0)["projectionScale"] == pytest.approx(
+        math.sqrt(300**2 + 400**2 + 1200**2))                   # ...the diagonal
+    assert safe.at(1.0)["position"] == pytest.approx(tl.at(1.0)["position"])   # same centre
+
+
+def test_rotation_safe_still_honours_the_margin():
+    tl = Timeline(_state(_seg("s", ["1"])), fps=10.0)
+    tl.frame_on(((0.0, 0.0, 0.0), (100.0, 0.0, 0.0)), at=0.0, seconds=1.0, units="voxels",
+                margin=2.0, rotation_safe=True)
+    assert tl.at(1.0)["projectionScale"] == pytest.approx(200.0)

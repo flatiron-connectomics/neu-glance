@@ -718,7 +718,8 @@ class Timeline:
 
     def frame_on(self, box: Any, *, at: float | None = None, seconds: float,
                  ease: str = DEFAULT_EASE, margin: float = 1.15, units: str = "nm",
-                 zoom: bool = True, min_scale: float | None = None) -> "Timeline":
+                 zoom: bool = True, min_scale: float | None = None,
+                 rotation_safe: bool = False) -> "Timeline":
         """Pan (and by default zoom) so ``box`` fills the view.
 
         ``box`` is ``(lo_zyx, hi_zyx)``, or anything with ``.lo``/``.hi`` so a
@@ -738,6 +739,16 @@ class Timeline:
         agree about what "fits" means. ``margin`` is its ``FIT_MARGIN``, room around the
         object; ``zoom=False`` pans without changing the zoom, for following something at a
         fixed scale rather than fitting it.
+
+        **``rotation_safe=True`` if the shot turns.** ``projectionScale`` sets how much world
+        the frame's HEIGHT spans (measured: the vertical fill of a fixed object is constant
+        across aspect ratios while the horizontal is not), so a box framed at one angle can
+        exceed the frame at another as its long axis swings towards the vertical. This fits
+        the box's diagonal — its bounding sphere — which no rotation can grow.
+
+        Centring matters as much as scale here, and this does both: an orbit pivots about the
+        state's ``position``, so an object framed at a pivot 10 um off its centre swings
+        bodily through the frame and leaves it, whatever the zoom.
         """
         lo, hi = (box.lo, box.hi) if hasattr(box, "lo") else box
         lo, hi = [float(v) for v in lo], [float(v) for v in hi]
@@ -752,6 +763,13 @@ class Timeline:
         moves: dict[str, Any] = {"position": [float(v) for v in centre[::-1]]}
         if zoom:
             scale = float(projection) * float(margin) / FIT_MARGIN
+            if rotation_safe:
+                # The box's DIAGONAL, i.e. its bounding sphere — the only extent that cannot
+                # grow under rotation. Framing on the box itself fits the object at the angle
+                # you framed it and clips at others, and the clipping is worst where the long
+                # axis swings towards the vertical. Costs empty space at every angle in
+                # exchange for never losing the subject at any.
+                scale *= math.sqrt(sum(e * e for e in extent)) / max(extent)
             # `min_scale` is a floor on how CLOSE the camera will go, and it is about motion
             # rather than framing. Fitting each object exactly means the zoom travels as far
             # as the objects differ in size, so a sequence visiting a large region and then a
