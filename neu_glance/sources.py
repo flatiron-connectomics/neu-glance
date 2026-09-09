@@ -309,11 +309,18 @@ def segment_boxes(volume: str, segment_ids: Sequence[Any], *, lod: int | None = 
     readback = _readback()
     ids = [str(s).lstrip("!") for s in segment_ids]
     boxes: dict[str, tuple[tuple, tuple]] = {}
+    # Resolved from `info` rather than left to default. `read_body_mesh` declares
+    # `mesh_dir: str = "mesh"`, so passing None through OVERRIDES its default with None and it
+    # goes looking for a subresource directory literally named "None" — which is absent, so
+    # every body comes back "no mesh" and the batch returns an empty dict. Structurally broken
+    # and indistinguishable from a volume that simply has no meshes, which is invariant
+    # SKIP-MISSING's whole subject. Resolving here makes a missing subresource raise instead.
+    directory = mesh_dir or _subresource(volume, "mesh")
 
     from concurrent.futures import ThreadPoolExecutor
 
     def one(sid: str):
-        raw = readback.read_body_mesh(volume, int(sid), mesh_dir=mesh_dir, lod=lod)
+        raw = readback.read_body_mesh(volume, int(sid), mesh_dir=directory, lod=lod)
         if raw is None:
             return sid, None
         vertices = raw[0]
@@ -328,3 +335,100 @@ def segment_boxes(volume: str, segment_ids: Sequence[Any], *, lod: int | None = 
             elif not skip_missing:
                 raise SourceProblem(f"{volume} has no mesh for segment {sid}")
     return boxes
+
+
+def _subresource(volume: str, key: str, info: Mapping[str, Any] | None = None) -> str:
+    """The subdirectory a volume's ``info`` names for ``key``. Never guessed.
+
+    A default would be a guess that loads and finds nothing — the same class of failure
+    `read_annotation_info` exists to prevent.
+    """
+    from neu_vol import read_json
+
+    info = info if info is not None else read_json(volume, "info")
+    name = (info or {}).get(key)
+    if not name:
+        present = ", ".join(k for k in ("mesh", "skeletons", "segment_properties")
+                            if (info or {}).get(k)) or "none"
+        raise SourceProblem(
+            f"{volume} declares no {key!r} subresource in its info (it has: {present}), so "
+            f"there is nothing to read")
+    return str(name)
+
+
+def segment_labels(volume: str, *, info: Mapping[str, Any] | None = None) -> dict[str, str]:
+    """``{segment_id: label}`` from a volume's ``segment_properties`` subresource.
+
+    The human-readable half of a segmentation. A neuropil is ``"LAL(L)"`` to anyone reading a
+    figure and ``22`` only to the file format, so this is what lets an animation be written in
+    names — which are reviewable — instead of ids nobody can check.
+
+    Reads the one ``info`` document and nothing else. The format keeps ids and each property's
+    values as parallel arrays, so the pairing is positional; a source whose arrays disagree in
+    length is refused rather than zipped short, since that would silently mislabel every
+    segment after the first mismatch.
+    """
+    from neu_vol import read_json
+
+    directory = _subresource(volume, "segment_properties", info)
+    document = read_json(f"{volume.rstrip('/')}/{directory}", "info")
+    declared = (document or {}).get("@type")
+    if declared != "neuroglancer_segment_properties":
+        raise SourceProblem(
+            f"{volume}/{directory} declares @type {declared!r}, not "
+            f"'neuroglancer_segment_properties' — that is not a segment properties source")
+    inline = (document or {}).get("inline")
+    if not inline:
+        raise SourceProblem(
+            f"{volume}/{directory} carries no `inline` block; only inline segment properties "
+            f"are readable here")
+    ids = [str(i) for i in inline.get("ids") or []]
+    labels = next((p.get("values") for p in inline.get("properties") or []
+                   if p.get("type") == "label"), None)
+    if labels is None:
+        kinds = ", ".join(sorted({str(p.get("type")) for p in inline.get("properties") or []}))
+        raise SourceProblem(
+            f"{volume}/{directory} has no property of type 'label' (it has: {kinds or 'none'})")
+    if len(labels) != len(ids):
+        raise SourceProblem(
+            f"{volume}/{directory} lists {len(ids)} ids and {len(labels)} labels; the format "
+            f"pairs them by position, so a mismatch would mislabel segments")
+    return dict(zip(ids, [str(v) for v in labels]))
+
+
+def segment_ids(volume: str, names: Sequence[str], *,
+                info: Mapping[str, Any] | None = None) -> list[str]:
+    """Segment ids for ``names``, in order. Raises on a name the source does not carry.
+
+    Refusing is the point: a mistyped region silently dropped from an animation is a shot that
+    renders perfectly and is missing a piece, which nobody notices until the video is watched.
+    Labels are not guaranteed unique, so a name matching several segments raises too rather
+    than picking one.
+    """
+    labels = segment_labels(volume, info=info)
+    by_name: dict[str, list[str]] = {}
+    for sid, label in labels.items():
+        by_name.setdefault(label, []).append(sid)
+
+    out, unknown, ambiguous = [], [], []
+    for name in names:
+        found = by_name.get(str(name))
+        if not found:
+            unknown.append(str(name))
+        elif len(found) > 1:
+            ambiguous.append(f"{name} ({', '.join(found)})")
+        else:
+            out.append(found[0])
+    if unknown:
+        import difflib
+        hints = {n: difflib.get_close_matches(n, by_name, n=3) for n in unknown}
+        detail = "; ".join(f"{n!r}" + (f" — did you mean {', '.join(h)}?" if h else "")
+                           for n, h in hints.items())
+        raise SourceProblem(
+            f"{volume} has no segment labelled {detail}. It has {len(by_name)} labels: "
+            f"{', '.join(sorted(by_name))}")
+    if ambiguous:
+        raise SourceProblem(
+            f"{volume} labels more than one segment {'; '.join(ambiguous)} — labels are not "
+            f"unique in this format, so name the id instead")
+    return out
