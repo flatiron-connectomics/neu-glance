@@ -432,3 +432,125 @@ def segment_ids(volume: str, names: Sequence[str], *,
             f"{volume} labels more than one segment {'; '.join(ambiguous)} — labels are not "
             f"unique in this format, so name the id instead")
     return out
+
+
+def read_segment_properties(volume: str, *, info: Mapping[str, Any] | None = None) -> dict:
+    """Everything a volume's ``segment_properties`` carries, in ONE read.
+
+    ``{"ids", "labels", "tags", "numbers", "vocabulary"}`` — ids as strings, labels parallel
+    to them, tags already resolved from indices to strings, and each numeric property under
+    its own name. The document is a single object holding every segment (19,983 on the
+    reference volume), so reading it once and slicing is the difference between one fetch and
+    one per question asked.
+
+    The format keeps every property as an array parallel to ``ids``, so **everything here is
+    positional** and a length mismatch is refused rather than zipped short — that would
+    silently attach one segment's label and another's tags to the same body.
+    """
+    from neu_vol import read_json
+
+    directory = _subresource(volume, "segment_properties", info)
+    document = read_json(f"{volume.rstrip('/')}/{directory}", "info")
+    declared = (document or {}).get("@type")
+    if declared != "neuroglancer_segment_properties":
+        raise SourceProblem(
+            f"{volume}/{directory} declares @type {declared!r}, not "
+            f"'neuroglancer_segment_properties' — that is not a segment properties source")
+    inline = (document or {}).get("inline")
+    if not inline:
+        raise SourceProblem(
+            f"{volume}/{directory} carries no `inline` block; only inline segment properties "
+            f"are readable here")
+
+    ids = [str(i) for i in inline.get("ids") or []]
+    out: dict[str, Any] = {"ids": ids, "labels": [], "tags": [], "numbers": {},
+                           "vocabulary": []}
+    for prop in inline.get("properties") or []:
+        values = prop.get("values") or []
+        if len(values) != len(ids):
+            raise SourceProblem(
+                f"{volume}/{directory} property {prop.get('id')!r} has {len(values)} values "
+                f"for {len(ids)} ids; the format pairs them by position, so a mismatch would "
+                f"attach them to the wrong segments")
+        kind = prop.get("type")
+        if kind == "label":
+            out["labels"] = [str(v) for v in values]
+        elif kind == "tags":
+            vocabulary = [str(t) for t in prop.get("tags") or []]
+            out["vocabulary"] = vocabulary
+            out["tags"] = [tuple(vocabulary[i] for i in row) for row in values]
+        elif kind == "number":
+            out["numbers"][str(prop.get("id"))] = list(values)
+    if not out["labels"]:
+        out["labels"] = list(ids)
+    if not out["tags"]:
+        out["tags"] = [()] * len(ids)
+    return out
+
+
+def segment_tags(volume: str, *, info: Mapping[str, Any] | None = None) -> dict[str, tuple]:
+    """``{segment_id: (tag, ...)}``, tags resolved from their vocabulary indices."""
+    read = read_segment_properties(volume, info=info)
+    return dict(zip(read["ids"], read["tags"]))
+
+
+def select_segments(volume: str, *, tags: Sequence[str] | None = None,
+                    any_tags: Sequence[str] | None = None,
+                    without: Sequence[str] | None = None,
+                    label: str | None = None, limit: int | None = None,
+                    order_by: str | None = "voxels", properties: Mapping | None = None
+                    ) -> list[str]:
+    """Segment ids matching a tag and/or label query. The way a NAMED SET gets built.
+
+    - ``tags`` — every one must be present (and);
+    - ``any_tags`` — at least one must be (or);
+    - ``without`` — none may be, which is how ``fragment`` and ``truncated`` get excluded;
+    - ``label`` — a regular expression, searched (not anchored) against the label string.
+
+    Combined with **and**, so ``tags=["side:L"], label=r"^KC"`` is left-side KCs. An empty
+    result is returned as such rather than raised on: a query matching nothing is a normal
+    answer while composing a set, unlike a *name* that does not exist.
+
+    ``limit`` keeps the largest by ``order_by`` (``voxels`` by default), because a set is
+    almost always trimmed for rendering and the biggest bodies are the ones that read on
+    screen — taking an arbitrary slice instead would drop exactly the ones worth seeing. Pass
+    ``order_by=None`` to keep the source's own order.
+
+    **Sets can be enormous** — ``side:R`` alone is 9,004 bodies on the reference volume, which
+    is a scene no viewer will draw. The count comes back for the caller to check; nothing here
+    guesses a ceiling.
+    """
+    import re
+
+    read = properties if properties is not None else read_segment_properties(volume)
+    pattern = re.compile(label) if label else None
+    tags, any_tags, without = set(tags or ()), set(any_tags or ()), set(without or ())
+
+    known = set(read.get("vocabulary") or ())
+    unknown = (tags | any_tags | without) - known
+    if unknown and known:
+        # A misspelled tag matches nothing and silently empties a set, which looks exactly
+        # like a set that legitimately has no members.
+        raise SourceProblem(
+            f"{volume} has no tag(s) {', '.join(sorted(unknown))}. It has {len(known)}, "
+            f"e.g. {', '.join(sorted(known)[:8])}")
+
+    chosen = []
+    for sid, name, has in zip(read["ids"], read["labels"], read["tags"]):
+        have = set(has)
+        if tags and not tags <= have:
+            continue
+        if any_tags and not (any_tags & have):
+            continue
+        if without and (without & have):
+            continue
+        if pattern is not None and not pattern.search(name):
+            continue
+        chosen.append(sid)
+
+    if limit is not None and len(chosen) > limit:
+        if order_by and order_by in (read.get("numbers") or {}):
+            size = dict(zip(read["ids"], read["numbers"][order_by]))
+            chosen.sort(key=lambda s: size.get(s, 0), reverse=True)
+        chosen = chosen[:limit]
+    return chosen

@@ -15,7 +15,9 @@ import struct
 import numpy as np
 import pytest
 
-from neu_glance.sources import (SourceProblem, segment_boxes, segment_ids, segment_labels)
+from neu_glance.sources import (SourceProblem, read_segment_properties,
+                                segment_boxes, segment_ids, segment_labels,
+                                segment_tags, select_segments)
 
 
 def _volume(tmp_path, *, labels=None, meshes=None, mesh_type="neuroglancer_legacy_mesh",
@@ -164,3 +166,96 @@ def test_boxes_come_back_in_NANOMETRES_through_the_sources_transform(tmp_path):
                   transform=[4, 0, 0, 0, 0, 4, 0, 0, 0, 0, 4, 0])
     (lo, hi) = segment_boxes(vol, ["5"])["5"]
     assert hi == pytest.approx((4.0, 4.0, 4.0))
+
+
+# --------------------------------------------------------------------------- #
+# tags, and building a set from a query
+# --------------------------------------------------------------------------- #
+def _tagged(tmp_path, rows, *, numbers=None):
+    """`rows` is {id: (label, [tags])}. Tags are stored as INDICES into a vocabulary."""
+    vocabulary = sorted({t for _, tags in rows.values() for t in tags})
+    root = tmp_path / "vol"
+    (root / "segment_properties").mkdir(parents=True, exist_ok=True)
+    (root / "info").write_text(json.dumps({"@type": "neuroglancer_multiscale_volume",
+                                           "segment_properties": "segment_properties",
+                                           "scales": []}))
+    properties = [
+        {"id": "instance", "type": "label", "values": [v[0] for v in rows.values()]},
+        {"id": "tags", "type": "tags", "tags": vocabulary,
+         "values": [[vocabulary.index(t) for t in v[1]] for v in rows.values()]},
+    ]
+    for name, values in (numbers or {}).items():
+        properties.append({"id": name, "type": "number", "values": values})
+    (root / "segment_properties" / "info").write_text(json.dumps({
+        "@type": "neuroglancer_segment_properties",
+        "inline": {"ids": list(rows), "properties": properties}}))
+    return str(root)
+
+
+ROWS = {
+    "1": ("KCa_1(L)", ["group:KCa", "side:L"]),
+    "2": ("KCa_2(R)", ["group:KCa", "side:R"]),
+    "3": ("KCb_1(L)", ["group:KCb", "side:L", "fragment"]),
+    "4": ("MBON01(L)", ["group:MBON", "side:L"]),
+    "5": ("PN_GL10(R)", ["group:PN", "side:R", "truncated"]),
+}
+
+
+def test_tags_are_resolved_from_their_vocabulary_indices(tmp_path):
+    """The format stores indices, not strings — reading them raw gives integers nobody can
+    query against."""
+    vol = _tagged(tmp_path, ROWS)
+    assert segment_tags(vol)["1"] == ("group:KCa", "side:L")
+
+
+def test_everything_comes_back_from_ONE_read(tmp_path):
+    """19,983 segments in a single object: reading it per question is the difference between
+    one fetch and one per set being composed."""
+    read = read_segment_properties(_tagged(tmp_path, ROWS, numbers={"voxels": [9, 8, 7, 6, 5]}))
+    assert read["ids"] == list(ROWS)
+    assert read["labels"][0] == "KCa_1(L)"
+    assert read["numbers"]["voxels"] == [9, 8, 7, 6, 5]
+    assert "side:L" in read["vocabulary"]
+
+
+def test_tags_combine_as_AND_and_a_label_regex_narrows_further(tmp_path):
+    vol = _tagged(tmp_path, ROWS)
+    assert select_segments(vol, tags=["group:KCa"]) == ["1", "2"]
+    assert select_segments(vol, tags=["group:KCa", "side:L"]) == ["1"]
+    assert select_segments(vol, label=r"^KC") == ["1", "2", "3"]
+    assert select_segments(vol, label=r"^KC", tags=["side:R"]) == ["2"]
+
+
+def test_any_tags_is_an_OR_and_without_excludes(tmp_path):
+    vol = _tagged(tmp_path, ROWS)
+    assert select_segments(vol, any_tags=["group:MBON", "group:PN"]) == ["4", "5"]
+    assert select_segments(vol, label=r"^KC", without=["fragment"]) == ["1", "2"]
+
+
+def test_a_MISSPELLED_tag_raises_rather_than_emptying_the_set(tmp_path):
+    """A tag that matches nothing looks exactly like a set that legitimately has no members,
+    and the animation renders with one population silently absent."""
+    vol = _tagged(tmp_path, ROWS)
+    with pytest.raises(SourceProblem, match="has no tag"):
+        select_segments(vol, tags=["group:KCz"])
+
+
+def test_a_query_that_legitimately_matches_nothing_is_NOT_an_error(tmp_path):
+    """Unlike a bad tag: an empty result is a normal answer while composing a set."""
+    vol = _tagged(tmp_path, ROWS)
+    assert select_segments(vol, tags=["group:KCa"], label=r"^MBON") == []
+
+
+def test_limit_keeps_the_LARGEST_not_an_arbitrary_slice(tmp_path):
+    """A set is nearly always trimmed for rendering, and the biggest bodies are the ones that
+    read on screen — an arbitrary slice drops exactly those."""
+    vol = _tagged(tmp_path, ROWS, numbers={"voxels": [1, 50, 2, 3, 4]})
+    assert select_segments(vol, label=r"^KC", limit=2) == ["2", "3"]
+    assert select_segments(vol, label=r"^KC", limit=2, order_by=None) == ["1", "2"]
+
+
+def test_properties_can_be_passed_in_to_avoid_re_reading(tmp_path):
+    """Six sets off one document should be one fetch, not six."""
+    read = read_segment_properties(_tagged(tmp_path, ROWS))
+    assert select_segments("unused://never-opened", properties=read,
+                           tags=["group:KCa"]) == ["1", "2"]

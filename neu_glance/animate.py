@@ -43,7 +43,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .shaders import as_hex_color
 from .state import (FIT_MARGIN, StateProblem, default_view, parse_url,
-                    split_segment_layer)
+                    split_segment_layer, subset_layers)
 
 
 class AnimateProblem(RuntimeError):
@@ -566,6 +566,21 @@ class Timeline:
         template = f"{prefix} {{segment}}" if prefix else "{layer} {segment}"
         self.base, created, notes = split_segment_layer(
             self.base, layer, names=names, segments=segments, name_template=template)
+        self.notes.extend(notes)
+        return created
+
+    def sets(self, layer: str, subsets: Mapping[str, Sequence[Any]], *,
+             colors: Mapping[str, str] | None = None,
+             object_alpha: float | None = None) -> dict[str, str]:
+        """One layer per named SET of segments. Returns ``{set: layer_name}``.
+
+        The populations sibling of :meth:`split` — see
+        :func:`neu_glance.subset_layers`. Use this when whole groups fade together and
+        :meth:`split` when individual objects do; four hundred Kenyon cells want one layer,
+        not four hundred.
+        """
+        self.base, created, notes = subset_layers(
+            self.base, layer, subsets, colors=colors, object_alpha=object_alpha)
         self.notes.extend(notes)
         return created
 

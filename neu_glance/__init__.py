@@ -48,6 +48,12 @@ _EXPORTS = {
     "default_view": "state",
     "annotation_extent": "state",
     "split_segment_layer": "state",
+    "subset_layers": "state",
+    "select_segments": "sources",
+    "segment_labels": "sources",
+    "segment_tags": "sources",
+    "segment_boxes": "sources",
+    "read_segment_properties": "sources",
     # Animation. `animate` is pure — stdlib only, no neuroglancer — so it costs nothing to
     # reach; `rendering` needs a viewer and stays behind the same `serve` extra as `serving`.
     "Timeline": "animate",

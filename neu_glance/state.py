@@ -304,6 +304,88 @@ def split_segment_layer(state: Mapping[str, Any], layer: str, *,
     return out, created, notes
 
 
+def subset_layers(state: Mapping[str, Any], layer: str,
+                  subsets: Mapping[str, Sequence[Any]], *,
+                  colors: Mapping[str, str] | None = None,
+                  object_alpha: float | None = None,
+                  name_template: str = "{subset}",
+                  ) -> tuple[dict, dict[str, str], list[str]]:
+    """One layer per NAMED SET of segments. Returns ``(state, {set: layer_name}, notes)``.
+
+    The many-bodies sibling of :func:`split_segment_layer`. That one gives every segment its
+    own layer, which is what an animation needs to fade objects **individually**; this gives
+    every *set* one, which is what it needs to fade whole populations — and a set of four
+    hundred Kenyon cells has no business being four hundred layers.
+
+    **Colour is per layer, via ``segmentDefaultColor``, not a `segmentColors` map.** A map
+    would need one identical entry per body — four hundred copies of the same string in the
+    state — where the default is a single field meaning exactly "everything in this layer".
+
+    That makes dropping the inherited ``segmentColors`` load-bearing rather than tidiness: an
+    entry for any body in the set **overrides** the default, so a scene where a handful of
+    neurons had been coloured by hand would render that handful in their old colours and the
+    rest in the new one. A set that is *almost* uniformly coloured looks like a data problem,
+    not a leftover.
+
+    The rules that :func:`split_segment_layer` documents apply here too: the original layer is
+    kept, emptied and hidden, because a dangling layer name resolves to nothing in silence;
+    the copies replace it **in place**, since neuroglancer draws in layer order; and ids stay
+    strings, because a 19-digit uint64 through a JSON number comes back rounded.
+    """
+    out = json.loads(json.dumps(dict(state)))            # deep copy; never mutate the caller's
+    existing = list(out.get("layers") or [])
+    index = next((i for i, lyr in enumerate(existing)
+                  if isinstance(lyr, dict) and lyr.get("name") == layer), None)
+    if index is None:
+        known = ", ".join(repr(lyr.get("name")) for lyr in existing if isinstance(lyr, dict))
+        raise StateProblem(f"no layer named {layer!r} in this state. It has: {known}")
+
+    source = existing[index]
+    if source.get("type") != "segmentation":
+        raise StateProblem(
+            f"layer {layer!r} is a {source.get('type')!r} layer; only a segmentation layer "
+            f"has segments to group")
+
+    notes: list[str] = []
+    taken = {lyr.get("name") for lyr in existing if isinstance(lyr, dict)}
+    created: dict[str, str] = {}
+    copies: list[dict] = []
+
+    for i, (subset, ids) in enumerate(subsets.items()):
+        members = [str(s).lstrip("!") for s in ids]
+        if not members:
+            notes.append(f"set {subset!r} is empty, so no layer was made for it")
+            continue
+        copy = json.loads(json.dumps(source))
+        copy["segments"] = members
+        copy.pop("segmentColors", None)
+        copy.pop("visible", None)
+        if colors and subset in colors:
+            copy["segmentDefaultColor"] = str(colors[subset])
+        if object_alpha is not None:
+            copy["objectAlpha"] = float(object_alpha)
+
+        name = name_template.format(subset=subset, layer=layer, index=i)
+        if name in taken:
+            suffix = 2
+            while f"{name}-{suffix}" in taken:
+                suffix += 1
+            notes.append(f"renamed set layer {name!r} to {name}-{suffix}: the state already "
+                         f"has a layer by that name")
+            name = f"{name}-{suffix}"
+        taken.add(name)
+        copy["name"] = name
+        created[subset] = name
+        copies.append(copy)
+
+    emptied = json.loads(json.dumps(source))
+    emptied["segments"] = []
+    emptied.pop("segmentColors", None)
+    emptied["visible"] = False
+    out["layers"] = existing[:index] + copies + [emptied] + existing[index + 1:]
+    return out, created, notes
+
+
 def _read_json(path: str, read_bytes=None):
     if read_bytes is None:
         from neu_vol.location import read_bytes as read_bytes_impl

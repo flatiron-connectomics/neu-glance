@@ -24,7 +24,8 @@ from neu_glance.animate import (CAMERA_KEYS, EASINGS, FADE_FROM, LAYER_DEFAULTS,
                                 PROPERTY_KINDS, AnimateProblem, Timeline, Tween, ease,
                                 interpolate_color_map, interpolate_hex_color,
                                 interpolate_quaternion, interpolate_zoom, kind_for)
-from neu_glance.state import StateProblem, split_segment_layer, state_url
+from neu_glance.state import (StateProblem, split_segment_layer, state_url,
+                              subset_layers)
 
 
 def _seg(name, segments, **extra):
@@ -806,3 +807,78 @@ def test_importing_animate_does_not_pull_in_neuroglancer():
             "assert 'neuroglancer' not in sys.modules; "
             "assert 'numpy' not in sys.modules")
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+# --------------------------------------------------------------------------- #
+# one layer per NAMED SET
+# --------------------------------------------------------------------------- #
+def test_a_set_becomes_ONE_layer_carrying_all_its_segments():
+    """Populations, not individuals: four hundred Kenyon cells want one layer, not four
+    hundred. `split_segment_layer` is the other half of this pair."""
+    state = _state(_seg("seg", ["1", "2", "3", "4"]))
+    out, made, _ = subset_layers(state, "seg", {"KCs": ["1", "2"], "MBONs": ["3"]})
+    assert made == {"KCs": "KCs", "MBONs": "MBONs"}
+    assert _layer(out, "KCs")["segments"] == ["1", "2"]
+    assert _layer(out, "MBONs")["segments"] == ["3"]
+
+
+def test_a_set_is_coloured_UNIFORMLY_by_default_not_by_a_per_segment_map():
+    """A map would need one identical entry per body; the default means "everything here"."""
+    state = _state(_seg("seg", ["1", "2"]))
+    out, _, _ = subset_layers(state, "seg", {"KCs": ["1", "2"]}, colors={"KCs": "#ffcc33"})
+    assert _layer(out, "KCs")["segmentDefaultColor"] == "#ffcc33"
+    assert "segmentColors" not in _layer(out, "KCs")
+
+
+def test_an_inherited_segmentColors_entry_is_DROPPED_because_it_would_override():
+    """A per-segment colour beats segmentDefaultColor, so a scene where a few bodies had been
+    coloured by hand would render those few in their old colours and the rest in the new one —
+    a set that is *almost* uniform, which reads as a data problem rather than a leftover."""
+    state = _state(_seg("seg", ["1", "2"], segmentColors={"1": "#19ffb6"}))
+    out, _, _ = subset_layers(state, "seg", {"KCs": ["1", "2"]}, colors={"KCs": "#ffcc33"})
+    assert "segmentColors" not in _layer(out, "KCs")
+
+
+def test_an_empty_set_makes_no_layer_and_says_so():
+    """A query matching nothing is normal while composing sets; a layer with no segments is
+    not, and would sit in the layer bar looking like a bug."""
+    state = _state(_seg("seg", ["1"]))
+    out, made, notes = subset_layers(state, "seg", {"KCs": ["1"], "nothing": []})
+    assert made == {"KCs": "KCs"}
+    assert any("is empty" in n for n in notes)
+
+
+def test_set_layers_replace_the_original_IN_PLACE_and_keep_it_emptied():
+    """Same two rules as the per-segment split: draw order is layer order, and a dangling
+    layer name resolves to nothing in silence."""
+    state = _state({"type": "image", "name": "em", "source": "zarr://s3://my-bucket/em"},
+                   _seg("seg", ["1", "2"]),
+                   _seg("rois", ["9"]))
+    out, _, _ = subset_layers(state, "seg", {"a": ["1"], "b": ["2"]})
+    assert [lyr["name"] for lyr in out["layers"]] == ["em", "a", "b", "seg", "rois"]
+    assert _layer(out, "seg")["visible"] is False
+
+
+def test_set_segment_ids_stay_strings():
+    big = "18446744073709551615"
+    out, _, _ = subset_layers(_state(_seg("seg", [big])), "seg", {"a": [big]})
+    assert _layer(out, "a")["segments"] == [big]
+
+
+def test_a_set_name_colliding_with_a_layer_is_renamed_and_reported():
+    state = _state(_seg("seg", ["1"]), _seg("KCs", ["9"]))
+    out, made, notes = subset_layers(state, "seg", {"KCs": ["1"]})
+    assert made == {"KCs": "KCs-2"}
+    assert any("renamed" in n for n in notes)
+
+
+def test_timeline_sets_returns_the_layer_names_and_they_animate():
+    """The whole point: a set fades as one object."""
+    tl = Timeline(_state(_seg("seg", ["1", "2", "3"])), fps=10.0)
+    made = tl.sets("seg", {"KCs": ["1", "2"], "MBONs": ["3"]},
+                   colors={"KCs": "#ffcc33", "MBONs": "#ff4d4d"})
+    tl.set(layer=made["KCs"], objectAlpha=0.0)
+    tl.tween(layer=made["KCs"], at=1.0, seconds=1.0, objectAlpha=1.0)
+    assert _layer(tl.at(0.0), "KCs")["objectAlpha"] == pytest.approx(0.0)
+    assert _layer(tl.at(2.0), "KCs")["objectAlpha"] == pytest.approx(1.0)
+    assert _layer(tl.at(2.0), "KCs")["segmentDefaultColor"] == "#ffcc33"
