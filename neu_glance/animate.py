@@ -703,7 +703,7 @@ class Timeline:
 
     def frame_on(self, box: Any, *, at: float | None = None, seconds: float,
                  ease: str = DEFAULT_EASE, margin: float = 1.15, units: str = "nm",
-                 zoom: bool = True) -> "Timeline":
+                 zoom: bool = True, min_scale: float | None = None) -> "Timeline":
         """Pan (and by default zoom) so ``box`` fills the view.
 
         ``box`` is ``(lo_zyx, hi_zyx)``, or anything with ``.lo``/``.hi`` so a
@@ -736,7 +736,14 @@ class Timeline:
         centre, _cross, projection = default_view(extent, lo)
         moves: dict[str, Any] = {"position": [float(v) for v in centre[::-1]]}
         if zoom:
-            moves["projectionScale"] = float(projection) * float(margin) / FIT_MARGIN
+            scale = float(projection) * float(margin) / FIT_MARGIN
+            # `min_scale` is a floor on how CLOSE the camera will go, and it is about motion
+            # rather than framing. Fitting each object exactly means the zoom travels as far
+            # as the objects differ in size, so a sequence visiting a large region and then a
+            # small one lurches in and out — the small ones read as rushed however long the
+            # move is given, because the distance covered is what makes it feel fast. A floor
+            # keeps the small ones a little loose and the sequence even.
+            moves["projectionScale"] = max(scale, float(min_scale)) if min_scale else scale
         return self.tween(at=at, seconds=seconds, ease=ease, **moves)
 
     def hold(self, seconds: float) -> "Timeline":

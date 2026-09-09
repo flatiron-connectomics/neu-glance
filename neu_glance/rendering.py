@@ -36,6 +36,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -215,6 +216,26 @@ def _write_atomic(path: str, data: bytes) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def stale_frames(out_dir: str, frame_count: int,
+                 pattern: str = "frame_%05d.png") -> list[str]:
+    """Frame files numbered at or past ``frame_count`` — leftovers from a longer earlier run.
+
+    **These silently corrupt the video, which is why they are worth hunting.** ``ffmpeg -i
+    frame_%05d.png`` consumes the whole numbered sequence it finds; it has no idea which run
+    wrote what. So shortening an animation and re-rendering leaves the tail of the previous
+    one still on disk, and the encode appends it — a video that ends with a scene the timeline
+    no longer contains, from an output directory where every individual frame is valid.
+    """
+    matcher = re.compile("^" + re.sub(r"%0?\d*d", r"(\\d+)", re.escape(pattern)
+                                      .replace("\\%", "%")) + "$")
+    out = []
+    for name in sorted(os.listdir(out_dir)) if os.path.isdir(out_dir) else []:
+        found = matcher.match(name)
+        if found and int(found.group(1)) >= frame_count:
+            out.append(os.path.join(out_dir, name))
+    return out
 
 
 def pending_frames(timeline: Timeline, out_dir: str, *, resume: bool = True,
@@ -434,6 +455,37 @@ def record(timeline: Timeline, out_dir: str, *, size: tuple[int, int] = (1920, 1
                           tweens=list(timeline.tweens), groups=dict(timeline.groups),
                           cursor=timeline.cursor)
         shaped.duration = timeline.duration
+
+    # **Resuming is only correct if the timeline has not changed**, and nothing else checks
+    # that. Nudge a timing, re-run, and the frames already on disk were rendered from the OLD
+    # animation — kept, mixed invisibly with new ones, and every single one a valid PNG. That
+    # is worse than the stale tail below, because it is in the middle of the sequence where
+    # nothing marks it. The timeline written beside the frames is the fingerprint that makes
+    # it detectable, so compare and fall back to a full render rather than trusting the flag.
+    recorded = os.path.join(out_dir, "timeline.json")
+    if resume and os.path.exists(recorded):
+        try:
+            with open(recorded) as f:
+                previous = json.load(f)
+        except (OSError, ValueError):
+            previous = None
+        if previous != shaped.to_json():
+            print("the timeline differs from the one these frames were rendered with — "
+                  "re-rendering all of them rather than mixing two animations", file=sys.stderr)
+            resume = False
+
+    # Leftovers from a longer earlier run go, whether or not this one is resuming: ffmpeg
+    # reads the whole numbered sequence, so leaving them appends the end of a previous
+    # animation to this one. Removed rather than refused, and named out loud — a warning about
+    # a correctness problem the user cannot see in any single frame is a warning that gets
+    # scrolled past.
+    leftovers = stale_frames(out_dir, shaped.frame_count, pattern)
+    if leftovers:
+        print(f"removing {len(leftovers)} frame(s) past the end of this timeline "
+              f"({os.path.basename(leftovers[0])}..{os.path.basename(leftovers[-1])}) — they "
+              f"are from a longer earlier run and ffmpeg would append them", file=sys.stderr)
+        for path in leftovers:
+            os.remove(path)
 
     todo = pending_frames(shaped, out_dir, resume=resume, start_frame=start_frame,
                           end_frame=end_frame, pattern=pattern)

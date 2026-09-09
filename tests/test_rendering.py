@@ -24,7 +24,7 @@ pytest.importorskip("neuroglancer", reason="the serve extra is not installed")
 from neu_glance.rendering import (  # noqa: E402
     CHROME_OFF, PNG_MAGIC, RenderProblem, _RequestQueue, _Tail, _write_atomic,
     ffmpeg_command, frame_path, is_written, pending_frames, print_encode_hint, record,
-    render_state, wait_for_browser)
+    render_state, stale_frames, wait_for_browser)
 
 
 def _state(**extra):
@@ -194,6 +194,71 @@ def test_resume_skips_frames_that_are_already_written_and_keeps_their_numbering(
     assert [i for i, _, _ in todo] == list(range(3, tl.frame_count))
     assert todo[0][1] == pytest.approx(0.3)
     assert not pending_frames(tl, str(tmp_path), resume=False)[0][0]     # index 0 back again
+
+
+def test_frames_left_over_past_the_END_of_the_timeline_are_REMOVED(tmp_path, capsys):
+    """These silently corrupt the video, which is why they are hunted rather than warned about.
+
+    `ffmpeg -i frame_%05d.png` consumes the whole numbered sequence and has no idea which run
+    wrote what. Shorten an animation, re-render, and the encode appends the tail of the
+    previous one — a video ending in a scene the timeline no longer contains, from a directory
+    where every individual frame is perfectly valid.
+    """
+    tl = _timeline()
+    for i in range(tl.frame_count + 5):                  # a longer previous run
+        _write_atomic(frame_path(str(tmp_path), i), PNG_MAGIC + b"x")
+    record(tl, str(tmp_path), size=(64, 32), viewer=_FakeViewer())
+    survivors = sorted(p.name for p in tmp_path.glob("frame_*.png"))
+    assert len(survivors) == tl.frame_count
+    assert "removing 5 frame(s) past the end" in capsys.readouterr().err
+
+
+def test_stale_detection_reads_the_index_out_of_the_PATTERN(tmp_path):
+    """A caller may rename the frames, and the sequence has to stay identifiable."""
+    for i in (0, 1, 9, 10):
+        (tmp_path / f"shot-{i:03d}.png").write_bytes(PNG_MAGIC)
+    (tmp_path / "notes.txt").write_bytes(b"not a frame")
+    stale = stale_frames(str(tmp_path), 9, "shot-%03d.png")
+    assert [os.path.basename(p) for p in stale] == ["shot-009.png", "shot-010.png"]
+
+
+def test_resuming_onto_a_CHANGED_timeline_re_renders_instead_of_mixing_two(tmp_path, capsys):
+    """The worst version of stale frames, because nothing marks them.
+
+    Frames left past the end of a shortened animation at least sit in a block at the end.
+    Frames rendered from an earlier version of the timeline sit in the MIDDLE, are valid PNGs
+    of the right size, and show the animation someone stopped wanting. The timeline written
+    beside them is what makes that detectable at all.
+    """
+    first = _timeline()
+    record(first, str(tmp_path), size=(64, 32), viewer=_FakeViewer())
+    for path in tmp_path.glob("frame_*.png"):
+        path.write_bytes(PNG_MAGIC + b"old")             # mark them as the previous render
+
+    changed = Timeline(_state(), fps=first.fps)
+    changed.tween(layer="seg", at=0.0, seconds=1.0, objectAlpha=0.5)     # a different fade
+    written = record(changed, str(tmp_path), size=(64, 32), viewer=_FakeViewer(), resume=True)
+    assert "differs from the one these frames were rendered with" in capsys.readouterr().err
+    assert len(written) == changed.frame_count
+    assert b"old" not in (tmp_path / "frame_00000.png").read_bytes()
+
+
+def test_resuming_an_UNCHANGED_timeline_still_skips_the_work(tmp_path):
+    """The check must not make resume useless — an interrupted long render is the point."""
+    tl = _timeline()
+    record(tl, str(tmp_path), size=(64, 32), viewer=_FakeViewer())
+    assert record(tl, str(tmp_path), size=(64, 32), viewer=_FakeViewer(), resume=True) == []
+
+
+def test_rendering_fresh_rewrites_frames_that_are_already_there(tmp_path):
+    """Iterating on timings must not need the output directory deleted by hand."""
+    tl = _timeline()
+    for i in range(tl.frame_count):
+        _write_atomic(frame_path(str(tmp_path), i), PNG_MAGIC + b"old")
+    assert record(tl, str(tmp_path), size=(64, 32), viewer=_FakeViewer(), resume=True) == []
+    written = record(tl, str(tmp_path), size=(64, 32), viewer=_FakeViewer(), resume=False)
+    assert len(written) == tl.frame_count
+    assert b"old" not in (tmp_path / "frame_00000.png").read_bytes()
 
 
 def test_pending_frames_does_not_build_the_states_up_front():
