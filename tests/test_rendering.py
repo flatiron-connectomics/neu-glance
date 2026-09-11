@@ -449,19 +449,36 @@ def test_A_SLOW_SCENE_IS_NOT_REPORTED_AS_A_MISSING_BROWSER():
     answers (first call); only the scene is slow.
     """
     viewer = _FakeViewer(answers=1, statistics=[(300, 1900, 12)])
-    with pytest.raises(RenderProblem, match="has sent nothing for") as excinfo:
+    with pytest.raises(RenderProblem, match="stopped loading") as excinfo:
         wait_for_browser(viewer, _state(), timeout=5.0, notify_every=0.1, stall_timeout=0.25)
     assert "300/1900" in str(excinfo.value)
     assert "no browser attached" not in str(excinfo.value)
 
 
-def test_loading_progress_is_reported_rather_than_a_bare_wait(capsys):
-    """"Loading 300/1900 chunks" is a working render; a bare wait looks like a hang."""
+def test_loading_progress_is_reported_rather_than_a_bare_wait(capsys, monkeypatch):
+    """"Loading 300/1900 chunks" is a working render; a bare wait looks like a hang.
+
+    With tqdm the bar carries this; without it, the same numbers go out as lines.
+    """
+    monkeypatch.setitem(sys.modules, "tqdm.auto", None)
     viewer = _FakeViewer(answers=1, statistics=[(300, 1900, 12)])
     with pytest.raises(RenderProblem):
-        wait_for_browser(viewer, _state(), timeout=5.0, notify_every=0.1, stall_timeout=0.25)
+        wait_for_browser(viewer, _state(), timeout=5.0, notify_every=0.05, stall_timeout=5.0)
     err = capsys.readouterr().err
     assert "browser attached" in err and "300/1900 chunks" in err
+
+
+def test_a_STALL_is_no_progress_not_silence(capsys):
+    """Statistics keep arriving once a second whatever happens, so a wait that watches for
+    SILENCE never fires — and the thing it has to catch sits at `N-1 / N chunks, 0
+    downloading` forever, which is exactly what a segment with no mesh looks like."""
+    viewer = _FakeViewer(answers=1, statistics=[(6476, 6477, 0)])
+    with pytest.raises(RenderProblem, match="stopped loading") as excinfo:
+        wait_for_browser(viewer, _state(), timeout=5.0, notify_every=0.05, stall_timeout=0.2)
+    message = str(excinfo.value)
+    assert "6476/6477" in message and "0 downloading" in message
+    assert "1 chunk(s) short" in message
+    assert "segments_with_meshes" in message, "it must name the fix, not just the symptom"
 
 
 # --------------------------------------------------------------------------- #

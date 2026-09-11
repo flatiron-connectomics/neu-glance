@@ -912,3 +912,28 @@ def test_rotation_safe_still_honours_the_margin():
     tl.frame_on(((0.0, 0.0, 0.0), (100.0, 0.0, 0.0)), at=0.0, seconds=1.0, units="voxels",
                 margin=2.0, rotation_safe=True)
     assert tl.at(1.0)["projectionScale"] == pytest.approx(200.0)
+
+
+def test_a_set_colour_is_normalised_to_hex_whatever_form_it_arrives_in():
+    """`segmentDefaultColor` must be #rrggbb, and anything else is IGNORED rather than
+    refused — so a matplotlib-style (0.12, 0.47, 0.71), which is what a palette hands you,
+    would stringify to something unparseable and every body would fall back to its hash
+    colour. The whole scene comes out in the wrong palette and nothing says so."""
+    state = _state(_seg("seg", ["1"]))
+    out, _, _ = subset_layers(state, "seg", {"a": ["1"]},
+                              colors={"a": (0.12156862745098039, 0.4666666666666667,
+                                            0.7058823529411765)})
+    assert _layer(out, "a")["segmentDefaultColor"] == "#1f77b4"      # matplotlib's tab:blue
+
+    named, _, _ = subset_layers(state, "seg", {"a": ["1"]}, colors={"a": "red"})
+    assert _layer(named, "a")["segmentDefaultColor"] == "#ff0000"
+    hexed, _, _ = subset_layers(state, "seg", {"a": ["1"]}, colors={"a": "#ffcc33"})
+    assert _layer(hexed, "a")["segmentDefaultColor"] == "#ffcc33"
+
+
+def test_an_unusable_set_colour_RAISES_rather_than_rendering_the_wrong_palette():
+    from neu_glance.shaders import ShaderProblem
+
+    with pytest.raises(ShaderProblem, match="colour for 'a'"):
+        subset_layers(_state(_seg("seg", ["1"])), "seg", {"a": ["1"]},
+                      colors={"a": "not-a-colour"})

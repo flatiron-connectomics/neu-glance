@@ -489,42 +489,62 @@ def wait_for_browser(viewer, state: Mapping[str, Any], *, timeout: float = 600.0
     print("browser attached; loading the scene", file=sys.stderr)
 
     viewer.set_state(dict(state))
-    attached, loaded = threading.Event(), threading.Event()
-    progress: dict[str, Any] = {"at": time.monotonic(), "loaded": 0, "total": 0}
+    loaded = threading.Event()
+    progress: dict[str, Any] = {"at": time.monotonic(), "loaded": 0, "total": 0, "best": 0,
+                                "downloading": 0}
 
     def on_statistics(statistics):
-        attached.set()
         total = statistics.total
-        progress.update(at=time.monotonic(),
-                        loaded=total.visible_chunks_gpu_memory,
-                        total=total.visible_chunks_total,
+        got = total.visible_chunks_gpu_memory
+        if got > progress["best"]:                 # PROGRESS, not merely a message
+            progress["best"] = got
+            progress["at"] = time.monotonic()
+        progress.update(loaded=got, total=total.visible_chunks_total,
                         downloading=total.visible_chunks_downloading)
 
-    def on_reply(_reply):
-        attached.set()
-        loaded.set()
+    viewer.async_screenshot(lambda _reply: loaded.set(), statistics_callback=on_statistics)
 
-    viewer.async_screenshot(on_reply, statistics_callback=on_statistics)
-
-    waited = 0.0
-    while not loaded.wait(max(0.1, notify_every)):
-        waited += notify_every
-        if watch is not None:
-            stopped = watch()
-            if stopped:
-                raise RenderProblem(stopped)
-        silent = time.monotonic() - progress["at"]
-        if attached.is_set() and silent >= stall_timeout:
-            raise RenderProblem(
-                f"the browser has sent nothing for {silent:.0f}s while loading the opening "
-                f"frame ({progress['loaded']}/{progress['total']} chunks). Reload and re-run "
-                f"— nothing has been written yet")
-        if progress["total"]:
-            print(f"  loading: {progress['loaded']}/{progress['total']} chunks "
-                  f"({progress.get('downloading', 0)} downloading, {waited:g}s)",
-                  file=sys.stderr)
-        else:
-            print(f"  loading the scene ({waited:g}s)", file=sys.stderr)
+    bar = _Progress(0, verbose=True)               # placeholder until a total is known
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        tqdm = None
+    else:
+        bar = tqdm(total=0, unit="chunk", desc="loading the scene", file=sys.stderr,
+                   dynamic_ncols=True)
+    try:
+        while not loaded.wait(1.0 if tqdm else max(0.1, notify_every)):
+            if watch is not None:
+                stopped = watch()
+                if stopped:
+                    raise RenderProblem(stopped)
+            # **Stalled means NO PROGRESS, not silence.** Statistics keep arriving once a
+            # second whatever happens, so a wait that watches for silence never fires — and
+            # the thing it needs to catch sits at `N-1 / N chunks, 0 downloading` forever.
+            silent = time.monotonic() - progress["at"]
+            if silent >= stall_timeout and progress["total"]:
+                missing = progress["total"] - progress["loaded"]
+                raise RenderProblem(
+                    f"the scene stopped loading {silent:.0f}s ago at "
+                    f"{progress['loaded']}/{progress['total']} chunks, "
+                    f"{progress['downloading']} downloading, and the viewer will never report "
+                    f"itself ready — so no frame can be captured.\n"
+                    f"    {missing} chunk(s) short. The usual cause is a SEGMENT WITH NO MESH: "
+                    f"neuroglancer counts it among the visible chunks and waits for it "
+                    f"forever. `neu_glance.sources.segments_with_meshes(volume, ids)` filters "
+                    f"those out — measured at 3s for 2200 bodies.")
+            if tqdm:
+                if progress["total"] and bar.total != progress["total"]:
+                    bar.total = progress["total"]
+                bar.n = progress["loaded"]
+                bar.set_postfix_str(f"{progress['downloading']} downloading", refresh=False)
+                bar.refresh()
+            elif progress["total"]:
+                print(f"  loading: {progress['loaded']}/{progress['total']} chunks "
+                      f"({progress['downloading']} downloading)", file=sys.stderr)
+    finally:
+        if tqdm:
+            bar.close()
     print("scene loaded; rendering", file=sys.stderr)
 
 

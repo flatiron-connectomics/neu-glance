@@ -585,3 +585,44 @@ def select_segments(volume: str, *, tags: Sequence[str] | None = None,
             chosen.sort(key=lambda s: size.get(s, 0), reverse=True)
         chosen = chosen[:limit]
     return chosen
+
+
+@_quiet
+def segments_with_meshes(volume: str, segment_ids: Sequence[Any], *,
+                         mesh_dir: str | None = None, threads: int = 32) -> list[str]:
+    """The subset of ``segment_ids`` whose meshes are actually in the store, in order.
+
+    **One segment with no mesh hangs a whole render, and nothing says so.** Neuroglancer
+    counts it among the layer's visible chunks and waits for it forever, so the viewer never
+    reports itself ready, so no screenshot is ever sent — the capture blocks at
+    ``N-1 / N chunks, 0 downloading`` indefinitely. Measured: eight real bodies render; the
+    same eight plus one nonexistent id sit at 32/33 and never finish.
+
+    Bodies get into a set through ``segment_properties``, which lists everything in the
+    segmentation — including whatever was never meshed. So the two disagree by a handful out
+    of thousands, and the handful is enough.
+
+    An existence probe per body, not a read: for an unsharded multi-resolution mesh the
+    manifest is one object per segment, so this is O(1) each and threads well. **A sharded
+    source has no per-body object**, so there is nothing to probe and every id is returned
+    unchecked rather than silently dropped — the same reasoning as invariant
+    SHARDED-SUBRESOURCE, where the unsharded reader reported every body absent.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from neu_vol import read_json
+    from neu_vol.location import exists
+
+    volume = volume.rstrip("/")
+    directory = mesh_dir or _subresource(volume, "mesh")
+    info = read_json(f"{volume}/{directory}", "info") or {}
+    ids = [str(s).lstrip("!") for s in segment_ids]
+
+    if info.get("sharding") is not None:
+        return ids
+    legacy = info.get("@type") == "neuroglancer_legacy_mesh"
+    key = (lambda sid: f"{sid}:0") if legacy else (lambda sid: f"{sid}.index")
+
+    with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
+        present = list(pool.map(lambda sid: exists(volume, directory, key(sid)), ids))
+    return [sid for sid, found in zip(ids, present) if found]

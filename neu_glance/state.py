@@ -22,6 +22,7 @@ import urllib.parse
 from typing import Any, Mapping, Sequence
 
 from .layers import output_dimensions
+from .shaders import as_hex_color
 
 DEFAULT_VIEWER = "https://neuroglancer-demo.appspot.com/"
 
@@ -361,7 +362,13 @@ def subset_layers(state: Mapping[str, Any], layer: str,
         copy.pop("segmentColors", None)
         copy.pop("visible", None)
         if colors and subset in colors:
-            copy["segmentDefaultColor"] = str(colors[subset])
+            # Through `as_hex_color`, not `str`. `segmentDefaultColor` must be `#rrggbb`, and
+            # anything else is IGNORED rather than refused — a matplotlib-style `(0.12, 0.47,
+            # 0.71)` stringifies to something neuroglancer cannot parse, so every body falls
+            # back to its hash colour and the scene comes out in entirely the wrong palette
+            # with nothing anywhere to say so. This also makes names and 3-sequences work,
+            # which is what anyone reaching for a palette already has.
+            copy["segmentDefaultColor"] = as_hex_color(colors[subset], f"colour for {subset!r}")
         if object_alpha is not None:
             copy["objectAlpha"] = float(object_alpha)
 
