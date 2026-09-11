@@ -109,66 +109,6 @@ def test_a_properties_source_of_the_wrong_type_is_refused(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# boxes
-# --------------------------------------------------------------------------- #
-def test_a_box_is_the_meshs_extent_in_ZYX(tmp_path):
-    """readback hands back xyz — the storage order — and everything here is zyx."""
-    vol = _volume(tmp_path, meshes={5: [[1, 2, 3], [7, 20, 300]]})
-    (lo, hi) = segment_boxes(vol, ["5"])["5"]
-    assert lo == pytest.approx((3.0, 2.0, 1.0))
-    assert hi == pytest.approx((300.0, 20.0, 7.0))
-
-
-def test_the_mesh_subresource_is_resolved_from_INFO_not_defaulted(tmp_path):
-    """`read_body_mesh` declares `mesh_dir: str = "mesh"`, so passing None through overrides
-    its default with None and it looks for a directory literally named "None" — absent, so
-    every body reads as having no mesh and the batch returns an empty dict. Structurally
-    broken, and indistinguishable from a volume that genuinely holds none."""
-    vol = _volume(tmp_path, meshes={5: [[0, 0, 0], [1, 1, 1]]})
-    assert segment_boxes(vol, ["5"], mesh_dir=None) != {}
-
-
-def test_a_volume_with_no_mesh_subresource_says_so(tmp_path):
-    vol = _volume(tmp_path, labels={"1": "a"})
-    with pytest.raises(SourceProblem, match="declares no 'mesh'"):
-        segment_boxes(vol, ["1"])
-
-
-def test_a_mesh_format_that_cannot_be_decoded_RAISES_rather_than_returning_nothing(tmp_path):
-    """Invariant SKIP-MISSING: skip_missing is about BODIES, and must not absorb a broken
-    source. Every structural failure looks like "no meshes here" — an empty dict, no error."""
-    from neu_morpho.readback import UnsupportedSubresource
-
-    vol = _volume(tmp_path, meshes={5: [[0, 0, 0]]},
-                  mesh_type="neuroglancer_mesh_from_the_future")
-    with pytest.raises(UnsupportedSubresource):
-        segment_boxes(vol, ["5"], skip_missing=True)
-
-
-def test_an_absent_body_is_skipped_or_reported_as_asked(tmp_path):
-    vol = _volume(tmp_path, meshes={5: [[0, 0, 0]]})
-    assert segment_boxes(vol, ["5", "404"], skip_missing=True) .keys() == {"5"}
-    with pytest.raises(SourceProblem, match="no mesh for segment 404"):
-        segment_boxes(vol, ["404"], skip_missing=False)
-
-
-def test_a_starred_but_hidden_id_is_still_readable(tmp_path):
-    """Segment lists carry `!` for starred-but-hidden, and a box is wanted regardless."""
-    vol = _volume(tmp_path, meshes={5: [[0, 0, 0], [1, 1, 1]]})
-    assert "5" in segment_boxes(vol, ["!5"])
-
-
-def test_boxes_come_back_in_NANOMETRES_through_the_sources_transform(tmp_path):
-    """Invariant NM-SPACE: one model space, whatever the publisher stored. A source declaring
-    a scale would otherwise hand back a box in its own units, framing the camera on a region
-    the right shape and the wrong size."""
-    vol = _volume(tmp_path, meshes={5: [[0, 0, 0], [1, 1, 1]]},
-                  transform=[4, 0, 0, 0, 0, 4, 0, 0, 0, 0, 4, 0])
-    (lo, hi) = segment_boxes(vol, ["5"])["5"]
-    assert hi == pytest.approx((4.0, 4.0, 4.0))
-
-
-# --------------------------------------------------------------------------- #
 # tags, and building a set from a query
 # --------------------------------------------------------------------------- #
 def _tagged(tmp_path, rows, *, numbers=None):
@@ -259,3 +199,72 @@ def test_properties_can_be_passed_in_to_avoid_re_reading(tmp_path):
     read = read_segment_properties(_tagged(tmp_path, ROWS))
     assert select_segments("unused://never-opened", properties=read,
                            tags=["group:KCa"]) == ["1", "2"]
+
+
+# --------------------------------------------------------------------------- #
+# Bounds come from MESHES, and the reader for those is `neu_morpho.readback` — behind
+# the optional `framing` extra, which CI does not install. Everything above needs only
+# this package's own dependencies; everything below is gated, the same split
+# `test_serve.py` makes for neuroglancer. Without it the suite is green in `neu-env`,
+# where everything is present, and red in CI for seven tests.
+# --------------------------------------------------------------------------- #
+pytest.importorskip("neu_morpho", reason="the framing extra is not installed")
+
+# --------------------------------------------------------------------------- #
+# boxes
+# --------------------------------------------------------------------------- #
+def test_a_box_is_the_meshs_extent_in_ZYX(tmp_path):
+    """readback hands back xyz — the storage order — and everything here is zyx."""
+    vol = _volume(tmp_path, meshes={5: [[1, 2, 3], [7, 20, 300]]})
+    (lo, hi) = segment_boxes(vol, ["5"])["5"]
+    assert lo == pytest.approx((3.0, 2.0, 1.0))
+    assert hi == pytest.approx((300.0, 20.0, 7.0))
+
+
+def test_the_mesh_subresource_is_resolved_from_INFO_not_defaulted(tmp_path):
+    """`read_body_mesh` declares `mesh_dir: str = "mesh"`, so passing None through overrides
+    its default with None and it looks for a directory literally named "None" — absent, so
+    every body reads as having no mesh and the batch returns an empty dict. Structurally
+    broken, and indistinguishable from a volume that genuinely holds none."""
+    vol = _volume(tmp_path, meshes={5: [[0, 0, 0], [1, 1, 1]]})
+    assert segment_boxes(vol, ["5"], mesh_dir=None) != {}
+
+
+def test_a_volume_with_no_mesh_subresource_says_so(tmp_path):
+    vol = _volume(tmp_path, labels={"1": "a"})
+    with pytest.raises(SourceProblem, match="declares no 'mesh'"):
+        segment_boxes(vol, ["1"])
+
+
+def test_a_mesh_format_that_cannot_be_decoded_RAISES_rather_than_returning_nothing(tmp_path):
+    """Invariant SKIP-MISSING: skip_missing is about BODIES, and must not absorb a broken
+    source. Every structural failure looks like "no meshes here" — an empty dict, no error."""
+    from neu_morpho.readback import UnsupportedSubresource
+
+    vol = _volume(tmp_path, meshes={5: [[0, 0, 0]]},
+                  mesh_type="neuroglancer_mesh_from_the_future")
+    with pytest.raises(UnsupportedSubresource):
+        segment_boxes(vol, ["5"], skip_missing=True)
+
+
+def test_an_absent_body_is_skipped_or_reported_as_asked(tmp_path):
+    vol = _volume(tmp_path, meshes={5: [[0, 0, 0]]})
+    assert segment_boxes(vol, ["5", "404"], skip_missing=True) .keys() == {"5"}
+    with pytest.raises(SourceProblem, match="no mesh for segment 404"):
+        segment_boxes(vol, ["404"], skip_missing=False)
+
+
+def test_a_starred_but_hidden_id_is_still_readable(tmp_path):
+    """Segment lists carry `!` for starred-but-hidden, and a box is wanted regardless."""
+    vol = _volume(tmp_path, meshes={5: [[0, 0, 0], [1, 1, 1]]})
+    assert "5" in segment_boxes(vol, ["!5"])
+
+
+def test_boxes_come_back_in_NANOMETRES_through_the_sources_transform(tmp_path):
+    """Invariant NM-SPACE: one model space, whatever the publisher stored. A source declaring
+    a scale would otherwise hand back a box in its own units, framing the camera on a region
+    the right shape and the wrong size."""
+    vol = _volume(tmp_path, meshes={5: [[0, 0, 0], [1, 1, 1]]},
+                  transform=[4, 0, 0, 0, 0, 4, 0, 0, 0, 0, 4, 0])
+    (lo, hi) = segment_boxes(vol, ["5"])["5"]
+    assert hi == pytest.approx((4.0, 4.0, 4.0))
