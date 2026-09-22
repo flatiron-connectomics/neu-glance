@@ -169,7 +169,7 @@ def test_the_into_error_is_yellow_only_on_a_terminal(monkeypatch):
             return True
 
     monkeypatch.delenv("NO_COLOR", raising=False)
-    assert cli._yellow("x", Tty()) == "\033[33mx\033[0m"
+    assert cli._yellow("x", Tty()) == "\033[93mx\033[0m"
     assert cli._yellow("x", object()) == "x"          # a pipe, a log, pytest's capture
     monkeypatch.setenv("NO_COLOR", "1")
     assert cli._yellow("x", Tty()) == "x"
@@ -194,7 +194,7 @@ def test_the_into_error_is_yellow_through_main_despite_the_log_filter(
     mangled = state_url(base).replace("#!%", "#", 1)
     with pytest.raises(SystemExit) as info:
         cli.main(["bboxes", volume, "--no-tighten", "--into", mangled])
-    assert str(info.value).startswith("\033[33m")
+    assert str(info.value).startswith("\033[93m")
 
 
 def test_into_renames_a_clashing_layer_and_says_so(tmp_path, volume, capsys):

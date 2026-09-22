@@ -249,7 +249,7 @@ def _yellow(text: str, stream=None) -> str:
         tty = _STDERR_IS_TTY if _STDERR_IS_TTY is not None else _isatty(sys.stderr)
     if os.environ.get("NO_COLOR") or not tty:
         return text
-    return f"\033[33m{text}\033[0m"
+    return f"\033[93m{text}\033[0m"      # 93, bright yellow: plain 33 reads as dark ochre
 
 
 def _load_into(source: str) -> dict:
