@@ -139,6 +139,42 @@ def test_into_accepts_a_url_as_well_as_a_file(tmp_path, volume, capsys):
     assert state["position"] == base["position"]
 
 
+def test_into_names_the_quoting_trap_for_a_url_that_lost_its_bang(tmp_path, volume):
+    """Double quotes let bash expand `#!%7B...` to `#7B...`. That is still a URL, and must
+    fail as a broken one rather than as "no such file"."""
+    from neu_glance.state import state_url
+
+    base, _path = _base_state(tmp_path)
+    mangled = state_url(base).replace("#!%", "#", 1)
+    with pytest.raises(SystemExit, match="single quotes") as info:
+        cli.main(["bboxes", volume, "--no-tighten", "--into", mangled])
+    assert "no such file" not in str(info.value)
+
+
+def test_serve_into_fails_the_same_way_and_before_reading_anything(tmp_path):
+    """The --seg path does not exist, so reaching it would fail differently: the state is
+    checked first."""
+    pytest.importorskip("neuroglancer", reason="the serve extra is not installed")
+    from neu_glance.state import state_url
+
+    base, _path = _base_state(tmp_path)
+    mangled = state_url(base).replace("#!%", "#", 1)
+    with pytest.raises(SystemExit, match="single quotes"):
+        cli.main(["serve", "--seg", str(tmp_path / "absent.h5"), "--into", mangled])
+
+
+def test_the_into_error_is_yellow_only_on_a_terminal(monkeypatch):
+    class Tty:
+        def isatty(self):
+            return True
+
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    assert cli._yellow("x", Tty()) == "\033[33mx\033[0m"
+    assert cli._yellow("x", object()) == "x"          # a pipe, a log, pytest's capture
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert cli._yellow("x", Tty()) == "x"
+
+
 def test_into_renames_a_clashing_layer_and_says_so(tmp_path, volume, capsys):
     """Neuroglancer keys a layer by name, so two layers sharing one is a collision rather
     than a duplicate — and the second silently shadows the first."""

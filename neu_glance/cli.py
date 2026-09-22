@@ -196,7 +196,9 @@ def _add_output_flags(q: argparse.ArgumentParser, *, formats: tuple[str, ...],
                         "one — a neuroglancer URL or a state JSON file. The state's own "
                         "dimensions, position and zoom are kept, so your view does not "
                         "move; a layer whose name is already taken is renamed and reported. "
-                        "Implies --format url unless --format says otherwise.")
+                        "Implies --format url unless --format says otherwise. Quote a URL "
+                        "with SINGLE quotes: inside double quotes bash expands '!', which "
+                        "neuroglancer uses both after '#' and for hidden segments.")
     if "state" in formats or "url" in formats:
         q.add_argument("--layout", default=None, choices=_LAYOUTS,
                        help="neuroglancer panel layout (default: 4panel, or whatever "
@@ -223,6 +225,33 @@ def _add_output_flags(q: argparse.ArgumentParser, *, formats: tuple[str, ...],
                        help=f"viewer base URL for --format url (default: "
                             f"{_DEFAULT_VIEWER})")
     q.set_defaults(default_format=default)
+
+
+def _yellow(text: str, stream=None) -> str:
+    """``text`` in yellow when ``stream`` (default stderr) is a terminal, else unchanged.
+
+    Plain for pipes, logs and tests, and whenever ``NO_COLOR`` is set (no-color.org).
+    """
+    import os
+
+    stream = sys.stderr if stream is None else stream
+    if os.environ.get("NO_COLOR") or not getattr(stream, "isatty", lambda: False)():
+        return text
+    return f"\033[33m{text}\033[0m"
+
+
+def _load_into(source: str) -> dict:
+    """The ``--into`` state, or exit with the reason — shared by every command taking one.
+
+    Its commonest failure is a URL bash mangled inside double quotes, which a user has no
+    reason to suspect, so the message is made to stand out.
+    """
+    from .state import StateProblem, load_state
+
+    try:
+        return load_state(source)
+    except (StateProblem, ValueError) as e:
+        raise SystemExit(_yellow(str(e))) from None
 
 
 def _resolve_format(args) -> str:
@@ -252,7 +281,7 @@ def _emit(args, layers: list[dict], *, voxel=None, units=None, frame=None,
     url`` and ``neu-glance gen`` from drifting into two different notions of a state.
     """
     from .layers import render
-    from .state import LONG_URL, StateProblem, load_state, merge_into, state_url
+    from .state import LONG_URL, merge_into, state_url
 
     err = sys.stderr
     into = getattr(args, "into", None)
@@ -280,10 +309,7 @@ def _emit(args, layers: list[dict], *, voxel=None, units=None, frame=None,
             show_slices=False if getattr(args, "hide_slices", False) else None,
         )
         if into:
-            try:
-                base = load_state(into)
-            except (StateProblem, ValueError) as e:
-                raise SystemExit(str(e)) from None
+            base = _load_into(into)
             state, notes = merge_into(base, layers, **shaping)
             print(f"added {len(layers)} layer(s) to {len(base.get('layers') or [])} "
                   f"already in {into if '#!' not in into else 'the given URL'}", file=err)
@@ -543,7 +569,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="port to serve on (default: 0, meaning any free one)")
     q.add_argument("--into", default=None, metavar="PATH_OR_URL",
                    help="start from an existing state, given as a URL or a JSON file, and "
-                        "add the served layers to it — keeping its view")
+                        "add the served layers to it — keeping its view. Single-quote a "
+                        "URL, since bash expands '!' inside double quotes")
     # `--annotate`, not `--annotations`: `gen --annotations SOURCE` already means "load
     # this precomputed annotation source", and one flag name meaning both that and "make me
     # an empty layer to draw in" is the kind of thing nobody reads the help for twice.
@@ -559,7 +586,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Decode the state out of a link, for reading or editing it.\n\n"
                     "Note that `gen --into` accepts a URL directly, so this is not a "
                     "required step in that workflow — it is the inspection tool.")
-    q.add_argument("url", help="the neuroglancer URL (or - to read one from stdin)")
+    q.add_argument("url", help="the neuroglancer URL, in single quotes (or - to read one "
+                               "from stdin)")
     q.add_argument("--layers", action="store_true",
                    help="print just the layer names and types, one per line")
     q.add_argument("--out", default=None, metavar="PATH_OR_URL",
@@ -935,6 +963,8 @@ def cmd_serve(args) -> int:
                  for src in (flag or ())]
     if not requested:
         raise SystemExit("nothing to serve: pass at least one --image, --seg or --prob")
+    # Also before anything is read: a URL bash mangled is found in milliseconds, a crop is not.
+    into = _load_into(args.into) if args.into else None
 
     layers = []
     for src, kind in requested:
@@ -960,12 +990,6 @@ def cmd_serve(args) -> int:
               f"origin {tuple(layer.frame.origin_nm)}  as {layer.name!r}",
               file=sys.stderr)
         layers.append(layer)
-
-    into = None
-    if args.into:
-        from .state import load_state
-
-        into = load_state(args.into)
 
     try:
         server = serve(layers, bind=args.bind, port=args.port, into=into,

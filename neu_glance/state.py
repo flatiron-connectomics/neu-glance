@@ -150,7 +150,10 @@ def state_url(state: Mapping[str, Any], viewer: str = DEFAULT_VIEWER) -> str:
 def parse_url(url: str) -> dict:
     """The state back out of a neuroglancer URL, for inspecting or editing one."""
     if "#!" not in url:
-        raise ValueError("not a neuroglancer state URL: no '#!' fragment")
+        raise ValueError(
+            "not a neuroglancer state URL: no '#!' fragment. If you passed it in double "
+            "quotes, bash history expansion may have eaten the '!' (a link starting "
+            "'#7B' has lost '!%'); put the URL in single quotes instead")
     fragment = url.split("#!", 1)[1]
     return json.loads(urllib.parse.unquote(fragment))
 
@@ -179,8 +182,12 @@ def load_state(source: str, read_bytes=None) -> dict:
 
     Accepting both is what makes ``--into`` usable directly on a link copied out of the
     browser, with no intermediate ``neu-glance parse`` step.
+
+    An ``http(s)://`` source is always a URL — no file can be read from one — so a link that
+    has lost its ``#!`` (bash expands ``!`` inside double quotes) fails as a broken URL
+    rather than as "no such file".
     """
-    if "#!" in source:
+    if "#!" in source or source.startswith(("http://", "https://")):
         return parse_url(source)
     obj = _read_json(source, read_bytes)
     if not isinstance(obj, dict) or "layers" not in obj:

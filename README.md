@@ -34,6 +34,15 @@ state's own `dimensions`, position and zoom are kept, so adding a layer does not
 view, and a layer whose name is already taken is renamed and reported rather than silently
 shadowing the one already there.
 
+**Put a neuroglancer URL in single quotes.** Inside double quotes an interactive bash expands
+`!`, and neuroglancer uses it twice: after the `#` that opens the state, and before a hidden
+segment's id (`"!12345"`). Losing the first gives a link starting `#7B` and an error; the
+second can silently splice an old command from your history into the segment list.
+
+```bash
+neu-glance gen --into 'https://neuroglancer-demo.appspot.com/#!%7B...' --layer boxes.json
+```
+
 ## Looking at something that is not published
 
 `serve` hosts arrays from this process and prints a viewer link — a ground-truth crop, a
