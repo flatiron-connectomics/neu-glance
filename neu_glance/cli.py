@@ -227,6 +227,15 @@ def _add_output_flags(q: argparse.ArgumentParser, *, formats: tuple[str, ...],
     q.set_defaults(default_format=default)
 
 
+#: Whether stderr was a terminal when `main` started. Asking later is wrong: inside `main`,
+#: `quiet_store_logs` has swapped fd 2 for a pipe, so stderr never looks like a terminal.
+_STDERR_IS_TTY: bool | None = None
+
+
+def _isatty(stream) -> bool:
+    return bool(getattr(stream, "isatty", lambda: False)())
+
+
 def _yellow(text: str, stream=None) -> str:
     """``text`` in yellow when ``stream`` (default stderr) is a terminal, else unchanged.
 
@@ -234,8 +243,11 @@ def _yellow(text: str, stream=None) -> str:
     """
     import os
 
-    stream = sys.stderr if stream is None else stream
-    if os.environ.get("NO_COLOR") or not getattr(stream, "isatty", lambda: False)():
+    if stream is not None:
+        tty = _isatty(stream)
+    else:
+        tty = _STDERR_IS_TTY if _STDERR_IS_TTY is not None else _isatty(sys.stderr)
+    if os.environ.get("NO_COLOR") or not tty:
         return text
     return f"\033[33m{text}\033[0m"
 
@@ -1055,6 +1067,8 @@ def main(argv=None) -> int:
     """
     import logging
 
+    global _STDERR_IS_TTY
+    _STDERR_IS_TTY = _isatty(sys.stderr)      # before quiet_store_logs swaps fd 2
     logging.basicConfig(level=logging.WARNING,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     args = _parse_args(argv)

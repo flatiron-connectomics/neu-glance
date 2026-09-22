@@ -175,6 +175,28 @@ def test_the_into_error_is_yellow_only_on_a_terminal(monkeypatch):
     assert cli._yellow("x", Tty()) == "x"
 
 
+def test_the_into_error_is_yellow_through_main_despite_the_log_filter(
+        tmp_path, volume, monkeypatch):
+    """`quiet_store_logs` swaps fd 2 for a pipe inside `main`, so asking stderr there always
+    says "not a terminal". The answer has to be taken before the swap."""
+    import io
+
+    from neu_glance.state import state_url
+
+    class TtyErr(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr(cli, "_STDERR_IS_TTY", None)
+    monkeypatch.setattr("sys.stderr", TtyErr())
+    base, _path = _base_state(tmp_path)
+    mangled = state_url(base).replace("#!%", "#", 1)
+    with pytest.raises(SystemExit) as info:
+        cli.main(["bboxes", volume, "--no-tighten", "--into", mangled])
+    assert str(info.value).startswith("\033[33m")
+
+
 def test_into_renames_a_clashing_layer_and_says_so(tmp_path, volume, capsys):
     """Neuroglancer keys a layer by name, so two layers sharing one is a collision rather
     than a duplicate — and the second silently shadows the first."""
