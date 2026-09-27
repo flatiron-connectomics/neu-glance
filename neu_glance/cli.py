@@ -469,7 +469,7 @@ def build_parser() -> argparse.ArgumentParser:
         q.add_argument(f"--{plural}", action="append", metavar="CSV",
                        help=f"a CSV of {plural} with columns {cols} (repeatable; a path, a "
                             f"URL, or - for stdin). Optional columns: id, description, "
-                            f"segments")
+                            f"segments, and segments:<relationship> for use with --link")
         q.add_argument(f"--{kind}", action="append", metavar="COORDS",
                        help=f"one {kind} inline as {cols} (repeatable)")
     q.add_argument("--scale", type=int, default=None, metavar="N",
@@ -482,6 +482,12 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--color", default="#ffee00", help="annotation colour")
     q.add_argument("--label", default="a", metavar="PREFIX",
                    help="prefix for generated annotation ids (default: %(default)s)")
+    q.add_argument("--link", action="append", default=[], metavar="[REL=]LAYER",
+                   help="bind a relationship to a segmentation LAYER (by its name in the "
+                        "state), which is what makes an annotation's segments selectable. "
+                        "REL=LAYER binds a segments:REL column; a bare LAYER binds the plain "
+                        "segments column. Repeatable, so one annotation can name a body in "
+                        "the reference and a segment in each of several other layers")
     q.add_argument("--voxel-size", default=None, metavar="Z,Y,X",
                    help="level-0 voxel size in nm, overriding the volume's")
     _add_output_flags(q, formats=("layer", "state", "url"), default="layer")
@@ -773,10 +779,28 @@ def _report_bindings(layers, *, file) -> None:
                   f"relationship index to be usable", file=file)
 
 
+def _parse_links(values) -> dict[str, str]:
+    """``--link`` values as ``{relationship: layer}``, in the order given."""
+    from .layers import DEFAULT_RELATIONSHIP
+
+    out: dict[str, str] = {}
+    for v in values or []:
+        rel, sep, lyr = v.partition("=")
+        rel, lyr = (rel.strip(), lyr.strip()) if sep else (DEFAULT_RELATIONSHIP, rel.strip())
+        if not rel or not lyr:
+            raise SystemExit(f"--link {v!r}: expected REL=LAYER or LAYER")
+        if rel in out:
+            raise SystemExit(f"--link binds relationship {rel!r} twice "
+                             f"({out[rel]!r} and {lyr!r}); each needs exactly one layer")
+        out[rel] = lyr
+    return out
+
+
 def cmd_annotate(args) -> int:
     """An annotation layer built from coordinates you supply."""
-    from .layers import (build_annotation, local_layer, output_dimensions, positions,
-                         read_annotation_csv, rescale)
+    from .layers import (DEFAULT_RELATIONSHIP, build_annotation, local_layer,
+                         output_dimensions, positions, read_annotation_csv,
+                         record_relationships, rescale)
 
     err = sys.stderr
     records = []
@@ -815,6 +839,23 @@ def cmd_annotate(args) -> int:
         records = rescale(records, tuple(1.0 / v for v in voxel))
         print(f"  nm          /{tuple(voxel)} (zyx) -> level-0 voxels", file=err)
 
+    links = _parse_links(args.link)
+    named = record_relationships(records)
+    if links:
+        unbound = [n for n in named if n not in links]
+        if unbound:
+            raise SystemExit(
+                f"relationship(s) {', '.join(unbound)} appear in the input but no --link "
+                f"binds them, so their ids would be dropped. Add --link "
+                f"{unbound[0]}=<segmentation layer name>.")
+    elif any(n != DEFAULT_RELATIONSHIP for n in named):
+        extra = [n for n in named if n != DEFAULT_RELATIONSHIP]
+        raise SystemExit(
+            f"the input has segments:<relationship> columns ({', '.join(extra)}) but no "
+            f"--link says which layer each refers to. Add --link {extra[0]}=<layer name> "
+            f"for each.")
+    order = list(links) if links else None
+
     ids, annotations = set(), []
     for i, r in enumerate(records):
         ident = str(r.get("id") or f"{args.label}{i:03d}")
@@ -823,7 +864,7 @@ def cmd_annotate(args) -> int:
                              f"annotations by id, so duplicates collide. Fix the `id` "
                              f"column, or drop it and let them be numbered.")
         ids.add(ident)
-        annotations.append(build_annotation(r, ident))
+        annotations.append(build_annotation(r, ident, order))
 
     dims, warning = output_dimensions(voxel, units)
     counts: dict[str, int] = {}
@@ -831,9 +872,12 @@ def cmd_annotate(args) -> int:
         counts[r["kind"]] = counts.get(r["kind"], 0) + 1
     print(f"  annotations {len(annotations)}: "
           + ", ".join(f"{n} {k}" for k, n in sorted(counts.items())), file=err)
-    n_seg = sum(1 for r in records if r.get("segments"))
+    n_seg = sum(1 for r in records if r.get("segments") or r.get("relationships"))
     if n_seg:
         print(f"  segments    {n_seg} annotation(s) linked to body ids", file=err)
+    if links:
+        print("  links       " + ", ".join(f"{k} -> {v}" for k, v in links.items()),
+              file=err)
 
     # A wrong unit is the failure mode here, and it does not look like one: coordinates
     # 8x off are still valid annotations, just somewhere else. The volume's extent is the
@@ -852,7 +896,8 @@ def cmd_annotate(args) -> int:
     if warning:
         print(f"\n  WARNING: {warning}", file=err)
 
-    layer = local_layer(annotations, dims, name=args.name, color=args.color)
+    layer = local_layer(annotations, dims, name=args.name, color=args.color,
+                        links=links or None)
     layers = _with_volume(args, [layer])
     return _emit(args, layers, voxel=voxel, units=units,
                  frame=(shape, (0, 0, 0)) if shape else None, selected=layer["name"])

@@ -68,6 +68,13 @@ CSV_COLUMNS: dict[str, tuple[tuple[str, ...], ...]] = {
 #: selecting one in the viewer selects them; neuroglancer writes those ids as *strings*.
 OPTIONAL_COLUMNS = ("id", "description", "segments")
 
+#: Prefix of a per-RELATIONSHIP segments column, ``segments:<name>``. A layer may declare
+#: several relationships, each bound to its own segmentation layer, so one annotation can
+#: name a body in the reference AND a segment in each delivery. The plain ``segments``
+#: column is the default relationship neuroglancer calls ``segments``.
+RELATIONSHIP_PREFIX = "segments:"
+DEFAULT_RELATIONSHIP = "segments"
+
 #: How many of a kind's leading coordinate groups are *positions*. An ellipsoid's second
 #: group is radii — an extent, not a place — so a bounds check must not treat it as one.
 POSITION_GROUPS = {"point": 1, "box": 2, "line": 2, "ellipsoid": 1}
@@ -142,8 +149,33 @@ def read_annotation_csv(text: str, kind: str, *, source: str = "<csv>") -> list[
             rec["description"] = clean["description"]
         if clean.get("segments"):
             rec["segments"] = _parse_segments(clean["segments"], f"{source} line {n}")
+        rels = {}
+        for key, value in clean.items():
+            if not key.startswith(RELATIONSHIP_PREFIX):
+                continue
+            name = key[len(RELATIONSHIP_PREFIX):].strip()
+            if not name:
+                raise ValueError(f"{source}: column {key!r} names no relationship; "
+                                 f"write it as segments:<name>, e.g. segments:gt")
+            # Present even when empty: "this delivery has nothing here" is an answer, and
+            # the column existing is what says the relationship belongs to the layer.
+            rels[name] = _parse_segments(value, f"{source} line {n}") if value else []
+        if rels:
+            rec["relationships"] = rels
         records.append(rec)
     return records
+
+
+def record_relationships(records: Sequence[dict]) -> list[str]:
+    """Every relationship the records name, in first-seen order. ``segments`` stands for
+    the plain column."""
+    seen: dict[str, None] = {}
+    for r in records:
+        if r.get("segments"):
+            seen.setdefault(DEFAULT_RELATIONSHIP, None)
+        for name in r.get("relationships", {}):
+            seen.setdefault(name, None)
+    return list(seen)
 
 
 def _parse_segments(value: str, where: str) -> list[str]:
@@ -172,12 +204,18 @@ def rescale(records: list[dict], factor_zyx: Sequence[float]) -> list[dict]:
     return out
 
 
-def build_annotation(record: dict, ident: str) -> dict:
+def build_annotation(record: dict, ident: str,
+                     relationships: Sequence[str] | None = None) -> dict:
     """One annotation object, zyx in and **xyz out** — the only place that flips.
 
     A ``box`` gets its corners sorted per axis: neuroglancer stores two corners with no
     requirement about order, and a reversed pair renders as nothing at all. A ``line``
     is left alone, because for a line the order *is* the direction.
+
+    ``relationships`` is the layer's declared order. ``segments`` is then one id list per
+    relationship **in that order** -- neuroglancer matches them by position, not by name,
+    so the order must come from the layer and never from a CSV's column order. Without it,
+    the single default relationship is written, as it always was.
     """
     kind = record["kind"]
     type_name, fields = KINDS[kind]
@@ -191,17 +229,35 @@ def build_annotation(record: dict, ident: str) -> dict:
         ann["description"] = record["description"]
     for field, group in zip(fields, coords):
         ann[field] = [float(v) for v in tuple(group)[::-1]]          # zyx -> xyz
-    if record.get("segments"):
-        # Related segments: an array per relationship, and a local layer has exactly
-        # one. Ids are strings — a uint64 body id does not survive a JSON number.
+    if relationships is not None:
+        rels = record.get("relationships", {})
+        per = [[str(s) for s in (rels.get(name)
+                                 or (record.get("segments") if name == DEFAULT_RELATIONSHIP
+                                     else None)
+                                 or [])]
+               for name in relationships]
+        if any(per):
+            ann["segments"] = per
+    elif record.get("segments"):
+        # Related segments: an array per relationship; unlinked, a local layer has the one
+        # default relationship. Ids are strings — a uint64 body id does not survive a JSON
+        # number.
         ann["segments"] = [[str(s) for s in record["segments"]]]
     return ann
 
 
 def local_layer(annotations: list[dict], dims: dict, *, name: str = "annotations",
-                color: str = "#ffee00") -> dict:
-    """The layer envelope for inline (``local://annotations``) annotations."""
-    return {
+                color: str = "#ffee00", links: dict[str, str] | None = None) -> dict:
+    """The layer envelope for inline (``local://annotations``) annotations.
+
+    ``links`` maps each relationship name to the segmentation LAYER it refers to, and is
+    what makes an annotation's segments selectable: without it the ids are stored but
+    inert, since neuroglancer does not know which layer they are ids of.
+    ``annotationRelationships`` must be a list of plain names -- a list of pairs is
+    rejected by the viewer's parser with "expected a string" -- and its order is the order
+    each annotation's ``segments`` lists are written in (:func:`build_annotation`).
+    """
+    layer = {
         "type": "annotation",
         "name": name,
         # opens the layer panel straight onto the clickable list
@@ -211,6 +267,10 @@ def local_layer(annotations: list[dict], dims: dict, *, name: str = "annotations
         "annotationColor": color,
         "annotations": annotations,
     }
+    if links:
+        layer["annotationRelationships"] = [str(k) for k in links]
+        layer["linkedSegmentationLayer"] = {str(k): str(v) for k, v in links.items()}
+    return layer
 
 
 def boxes_layer(regions: list[dict], dims: dict, *, name: str = "regions",

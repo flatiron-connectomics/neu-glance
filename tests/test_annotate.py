@@ -133,6 +133,88 @@ def test_segments_are_strings_in_a_per_relationship_array(tmp_path, volume, caps
     assert "2 annotation(s) linked to body ids" in err
 
 
+# --------------------------------------------------------------------------- #
+# relationships bound to segmentation layers (--link)
+# --------------------------------------------------------------------------- #
+def test_link_binds_each_relationship_to_its_layer(tmp_path, volume, capsys):
+    """One annotation naming a body in the reference AND a segment in a delivery, each
+    selectable in its own layer. `annotationRelationships` must be plain NAMES: a list of
+    (name, layer) pairs is what the viewer rejects with "expected a string"."""
+    path = _csv(tmp_path, "l.csv",
+                "z0,y0,x0,z1,y1,x1,segments:gt,segments:vi\n"
+                "1,2,3,4,5,6,2034 2153,139245\n")
+    layer, err = _run(capsys, "--volume", volume, "--lines", path,
+                      "--link", "gt=gt_v2_relabel", "--link", "vi=etched")
+    assert layer["annotationRelationships"] == ["gt", "vi"]
+    assert all(isinstance(r, str) for r in layer["annotationRelationships"])
+    assert layer["linkedSegmentationLayer"] == {"gt": "gt_v2_relabel", "vi": "etched"}
+    assert layer["annotations"][0]["segments"] == [["2034", "2153"], ["139245"]]
+    assert "gt -> gt_v2_relabel, vi -> etched" in err
+
+
+def test_segment_lists_follow_the_LINK_order_not_the_column_order(tmp_path, volume, capsys):
+    """Neuroglancer pairs each list with a relationship by POSITION, so a CSV that happens
+    to put its columns the other way round must not swap which layer the ids select in."""
+    path = _csv(tmp_path, "p.csv", "z,y,x,segments:vi,segments:gt\n1,2,3,7,9\n")
+    layer, _ = _run(capsys, "--volume", volume, "--points", path,
+                    "--link", "gt=G", "--link", "vi=V")
+    assert layer["annotationRelationships"] == ["gt", "vi"]
+    assert layer["annotations"][0]["segments"] == [["9"], ["7"]]
+
+
+def test_an_empty_relationship_is_an_empty_list_not_a_shifted_one(tmp_path, volume, capsys):
+    """A delivery with nothing at the point is an answer; dropping its list would move the
+    next relationship's ids into its slot."""
+    path = _csv(tmp_path, "p.csv", "z,y,x,segments:gt,segments:vi\n1,2,3,,5\n")
+    layer, _ = _run(capsys, "--volume", volume, "--points", path,
+                    "--link", "gt=G", "--link", "vi=V")
+    assert layer["annotations"][0]["segments"] == [[], ["5"]]
+
+
+def test_a_bare_link_binds_the_plain_segments_column(tmp_path, volume, capsys):
+    path = _csv(tmp_path, "p.csv", "z,y,x,segments\n1,2,3,42\n")
+    layer, _ = _run(capsys, "--volume", volume, "--points", path, "--link", "seg")
+    assert layer["annotationRelationships"] == ["segments"]
+    assert layer["linkedSegmentationLayer"] == {"segments": "seg"}
+    assert layer["annotations"][0]["segments"] == [["42"]]
+
+
+def test_without_link_the_layer_is_unchanged(tmp_path, volume, capsys):
+    path = _csv(tmp_path, "p.csv", "z,y,x,segments\n1,2,3,42\n")
+    layer, _ = _run(capsys, "--volume", volume, "--points", path)
+    assert "annotationRelationships" not in layer
+    assert "linkedSegmentationLayer" not in layer
+    assert layer["annotations"][0]["segments"] == [["42"]]
+
+
+def test_relationship_columns_without_any_link_are_refused(tmp_path, volume):
+    path = _csv(tmp_path, "p.csv", "z,y,x,segments:gt\n1,2,3,42\n")
+    with pytest.raises(SystemExit, match="no --link says which layer"):
+        cli.main(["annotate", "--volume", volume, "--points", path])
+
+
+def test_a_relationship_nobody_linked_is_refused_rather_than_dropped(tmp_path, volume):
+    path = _csv(tmp_path, "p.csv", "z,y,x,segments:gt,segments:vi\n1,2,3,1,2\n")
+    with pytest.raises(SystemExit, match="vi appear in the input but no --link"):
+        cli.main(["annotate", "--volume", volume, "--points", path, "--link", "gt=G"])
+
+
+def test_a_relationship_linked_twice_is_refused(tmp_path, volume):
+    path = _csv(tmp_path, "p.csv", "z,y,x\n1,2,3\n")
+    with pytest.raises(SystemExit, match="twice"):
+        cli.main(["annotate", "--volume", volume, "--points", path,
+                  "--link", "gt=A", "--link", "gt=B"])
+
+
+def test_a_linked_layer_may_have_relationships_no_annotation_uses(tmp_path, volume, capsys):
+    """A delivery that does not reach a region still belongs to the layer: linking it and
+    listing nothing is correct, not an error."""
+    path = _csv(tmp_path, "p.csv", "z,y,x,segments:gt\n1,2,3,5\n")
+    layer, _ = _run(capsys, "--volume", volume, "--points", path,
+                    "--link", "gt=G", "--link", "vi=V")
+    assert layer["annotations"][0]["segments"] == [["5"], []]
+
+
 def test_a_segment_id_that_went_through_a_spreadsheet_is_rejected(tmp_path, volume):
     """`1.23e+18` is what Excel does to a body id, and it links to nothing."""
     path = _csv(tmp_path, "p.csv", "z,y,x,segments\n1,2,3,1.23e+18\n")
